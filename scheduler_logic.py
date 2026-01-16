@@ -103,11 +103,12 @@ class Scheduler:
     Uses a greedy/scoring approach with constraint satisfaction.
     """
 
-    # Gap constraints
-    MIN_NIGHT_TO_NIGHT_GAP = 5      # Normal: minimum 5 days between night shifts
-    EMERGENCY_NIGHT_TO_NIGHT_GAP = 3  # Fallback: minimum 3 days if not enough staff
-    MIN_DAY_TO_DAY_GAP = 3          # Minimum 3 days between day shifts
-    MIN_NIGHT_TO_DAY_GAP = 3        # After night, must wait 3 days for day shift
+    # Gap constraints (values are date differences, so "间隔3天" means difference >= 4)
+    # Example: shift on day 27, next allowed on day 31 (27+4=31, with 28,29,30 as 3 gap days)
+    MIN_NIGHT_TO_NIGHT_GAP = 6      # Normal: 5 days between night shifts (diff >= 6)
+    EMERGENCY_NIGHT_TO_NIGHT_GAP = 4  # Fallback: 3 days between if not enough staff (diff >= 4)
+    MIN_DAY_TO_DAY_GAP = 4          # 3 days between day shifts (diff >= 4)
+    MIN_NIGHT_TO_DAY_GAP = 4        # After night, 3 days before day shift (diff >= 4)
 
     def __init__(
         self,
