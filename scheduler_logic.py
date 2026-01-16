@@ -786,7 +786,7 @@ class Scheduler:
 
     def _optimize_schedule(self):
         """
-        Post-generation optimization: try to balance weekend and night shifts
+        Post-generation optimization: try to balance weekend, night, and total shifts
         by swapping assignments between people.
         """
         max_iterations = 50  # Prevent infinite loops
@@ -807,6 +807,10 @@ class Scheduler:
 
             # Try to reduce burden on high-total people
             if self._try_balance_high_total_burden():
+                improved = True
+
+            # Try to balance total shifts (ensure difference <= 1)
+            if self._try_balance_total_shifts():
                 improved = True
 
     def _try_balance_weekend_shifts(self) -> bool:
@@ -978,6 +982,62 @@ class Scheduler:
                                 if self._can_swap_shift(high_person, other_person, d, shift_type):
                                     self._perform_swap(high_person, other_person, d, shift_type)
                                     return True
+
+        return False
+
+    def _try_balance_total_shifts(self) -> bool:
+        """
+        Try to balance total shifts so that the difference is at most 1.
+        Uses normalized shifts (accounting for target ratio - half-month people count as 2x).
+        """
+        total_days = len(self.dates)
+
+        # Normalize total shifts for target ratio comparison
+        def get_norm_total(p):
+            ratio = p.get_target_ratio(total_days)
+            return p.total_shifts * 2 if ratio == 0.5 else p.total_shifts
+
+        norm_totals = [(name, get_norm_total(p)) for name, p in self.staff.items()]
+        if not norm_totals:
+            return False
+
+        max_total = max(c[1] for c in norm_totals)
+        min_total = min(c[1] for c in norm_totals)
+
+        # If difference <= 1, no need to balance
+        if max_total - min_total <= 1:
+            return False
+
+        # Find people with max and min total shifts
+        high_people = [name for name, count in norm_totals if count == max_total]
+        low_people = [name for name, count in norm_totals if count == min_total]
+
+        # Try to find a swap: move a shift from high to low
+        for high_name in high_people:
+            high_person = self.staff[high_name]
+
+            # Get all shifts for this person, sorted by date
+            all_shifts = [
+                (d, shift_type) for (name, d), shift_type in self.schedule.items()
+                if name == high_name
+            ]
+            all_shifts.sort(key=lambda x: x[0])
+
+            for d, shift_type in all_shifts:
+                # Try to find someone with fewer total shifts who can take this
+                for low_name in low_people:
+                    low_person = self.staff[low_name]
+
+                    # Check if low_person can take this shift
+                    if self._can_swap_shift(high_person, low_person, d, shift_type):
+                        # Verify the swap would improve balance
+                        new_high_norm = get_norm_total(high_person) - (2 if high_person.get_target_ratio(total_days) == 0.5 else 1)
+                        new_low_norm = get_norm_total(low_person) + (2 if low_person.get_target_ratio(total_days) == 0.5 else 1)
+
+                        # Only swap if it improves or maintains balance
+                        if new_high_norm >= new_low_norm - 1:
+                            self._perform_swap(high_person, low_person, d, shift_type)
+                            return True
 
         return False
 
