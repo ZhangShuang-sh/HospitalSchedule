@@ -132,6 +132,15 @@ class Scheduler:
         # Schedule storage: (person_name, date) -> ShiftType
         self.schedule: Dict[Tuple[str, date], ShiftType] = {}
 
+        # Pre-calculate holiday workers (people with fixed_on dates that are holidays)
+        # This is a HARD constraint that must be known BEFORE scheduling starts
+        self.holiday_workers: Set[str] = set()
+        for person in self.staff.values():
+            for d in person.fixed_on_dates.keys():
+                if d in self.holidays:
+                    self.holiday_workers.add(person.name)
+                    break
+
         # Calculate targets
         self._calculate_targets()
 
@@ -184,6 +193,14 @@ class Scheduler:
     def is_weekend_or_holiday(self, d: date) -> bool:
         """Check if date is weekend or holiday."""
         return self.is_weekend(d) or self.is_holiday(d)
+
+    def is_holiday_worker(self, person: Person) -> bool:
+        """
+        Check if person is a holiday worker (has fixed_on dates that are holidays).
+        This is determined at initialization and does NOT change during scheduling.
+        Holiday workers CANNOT work weekends - this is a HARD constraint.
+        """
+        return person.name in self.holiday_workers
 
     def _get_weekend_pair(self, d: date) -> Optional[date]:
         """Get the other day of the same weekend (Sat->Sun or Sun->Sat)."""
@@ -266,6 +283,10 @@ class Scheduler:
 
         # Weekend constraint: max 1 shift per weekend per person
         if self.is_weekend(d):
+            # HARD CONSTRAINT: Holiday workers CANNOT work weekends
+            if self.is_holiday_worker(person):
+                return False
+
             other_day = self._get_weekend_pair(d)
             if other_day and other_day in person.assigned_dates:
                 return False  # Already has a shift on the other day of this weekend
@@ -369,16 +390,18 @@ class Scheduler:
                         return False, "Night fairness: others have fewer night shifts"
 
         # HARD CONSTRAINT: Holiday workers CANNOT work weekends (strict rule)
+        # Use is_holiday_worker (pre-calculated) OR holiday_shifts > 0 (runtime)
         if self.is_weekend(d):
-            if person.holiday_shifts > 0:
+            if self.is_holiday_worker(person) or person.holiday_shifts > 0:
                 return False, "Holiday worker cannot work weekend (strict rule)"
 
         # HARD CONSTRAINT: Weekend fairness - max difference of 1
         # Only compare among non-holiday workers (holiday workers are excluded from weekends)
         if self.is_weekend(d):
             # Weekend fairness only among non-holiday workers
-            comparable_staff = [p for p in self.staff.values() if p.holiday_shifts == 0]
-            if comparable_staff and person.holiday_shifts == 0:
+            comparable_staff = [p for p in self.staff.values()
+                               if not self.is_holiday_worker(p) and p.holiday_shifts == 0]
+            if comparable_staff and not self.is_holiday_worker(person) and person.holiday_shifts == 0:
                 min_weekend = min(p.weekend_shifts for p in comparable_staff)
 
                 # Block if this person already has more weekend shifts than minimum
@@ -517,10 +540,10 @@ class Scheduler:
         if self.is_weekend(d):
             # FIRST: Check holiday penalty (highest priority)
             # 节假日值班的人不应该再排周末
-            if person.holiday_shifts > 0:
+            if self.is_holiday_worker(person) or person.holiday_shifts > 0:
                 # Check if there are others without holiday shifts who can work
                 others_no_holiday = any(
-                    p.holiday_shifts == 0 and p.name != person.name
+                    not self.is_holiday_worker(p) and p.holiday_shifts == 0 and p.name != person.name
                     and self._basic_can_assign(p, d, shift_type)
                     for p in self.staff.values()
                 )
@@ -528,8 +551,9 @@ class Scheduler:
                     score -= 1000  # Extremely strong penalty - almost a hard block
 
             # Weekend fairness only among non-holiday workers
-            comparable_staff = [p for p in self.staff.values() if p.holiday_shifts == 0]
-            if comparable_staff and person.holiday_shifts == 0:
+            comparable_staff = [p for p in self.staff.values()
+                               if not self.is_holiday_worker(p) and p.holiday_shifts == 0]
+            if comparable_staff and not self.is_holiday_worker(person) and person.holiday_shifts == 0:
                 min_weekend = min(p.weekend_shifts for p in comparable_staff)
                 max_weekend = max(p.weekend_shifts for p in comparable_staff)
 
@@ -585,8 +609,19 @@ class Scheduler:
 
         return score
 
-    def _assign_shift(self, person: Person, d: date, shift_type: ShiftType):
-        """Assign a shift to a person and update their stats."""
+    def _assign_shift(self, person: Person, d: date, shift_type: ShiftType) -> bool:
+        """
+        Assign a shift to a person and update their stats.
+        Returns True if assignment was successful, False if blocked by hard constraint.
+        """
+        # HARD CONSTRAINT CHECK: Holiday workers CANNOT be assigned weekend shifts
+        if self.is_weekend(d):
+            # Check if this person is or will be a holiday worker
+            is_holiday_worker = self.is_holiday_worker(person) or person.holiday_shifts > 0
+            if is_holiday_worker:
+                # BLOCK: Do not assign weekend shift to holiday worker
+                return False
+
         self.schedule[(person.name, d)] = shift_type
         person.assigned_dates.add(d)
 
@@ -611,6 +646,8 @@ class Scheduler:
             person.weekend_shifts += 1
         if self.is_holiday(d):
             person.holiday_shifts += 1
+
+        return True
 
     def _emergency_can_assign(self, person: Person, d: date, shift_type: ShiftType) -> bool:
         """
@@ -637,7 +674,7 @@ class Scheduler:
             return False
 
         # HARD CONSTRAINT: Holiday workers CANNOT work weekends (even in emergency)
-        if self.is_weekend(d) and person.holiday_shifts > 0:
+        if self.is_weekend(d) and (self.is_holiday_worker(person) or person.holiday_shifts > 0):
             return False
 
         # Emergency gap rules - check against ALL assigned shifts, not just last
@@ -756,6 +793,13 @@ class Scheduler:
             # Post-generation optimization: try to balance shifts
             self._optimize_schedule()
 
+            # CRITICAL: Validate hard constraints AFTER optimization
+            # If hard constraints are violated, reject this schedule entirely
+            is_valid, violations = self._validate_hard_constraints()
+            if not is_valid:
+                # This schedule violates hard constraints, skip it
+                continue
+
             # Calculate fairness score (lower is better)
             score = self._calculate_fairness_score()
 
@@ -782,11 +826,70 @@ class Scheduler:
 
         return False
 
+    def _fix_holiday_worker_weekend_violations(self):
+        """
+        CRITICAL: Fix any cases where holiday workers have weekend shifts.
+        This is a HARD constraint that must be satisfied.
+        Try to swap these weekend shifts to non-holiday workers.
+        """
+        max_attempts = 50  # Limit attempts to avoid infinite loop
+
+        for attempt in range(max_attempts):
+            # Find holiday workers with weekend shifts
+            violations = []
+            for person in self.staff.values():
+                is_holiday_worker = self.is_holiday_worker(person) or person.holiday_shifts > 0
+                if is_holiday_worker and person.weekend_shifts > 0:
+                    # Find their weekend shifts
+                    weekend_shifts = [
+                        (d, shift_type) for (name, d), shift_type in self.schedule.items()
+                        if name == person.name and self.is_weekend(d)
+                    ]
+                    for d, shift_type in weekend_shifts:
+                        violations.append((person, d, shift_type))
+
+            if not violations:
+                return  # No violations, done
+
+            # Try to fix each violation
+            fixed_any = False
+            for person, d, shift_type in violations:
+                # Find a non-holiday worker who can take this shift
+                candidates = []
+                for other_name, other_person in self.staff.items():
+                    if other_name == person.name:
+                        continue
+                    # Must not be a holiday worker
+                    if self.is_holiday_worker(other_person) or other_person.holiday_shifts > 0:
+                        continue
+                    # Must be able to take this shift
+                    if self._can_swap_shift(person, other_person, d, shift_type):
+                        # Prefer people with fewer weekend shifts
+                        candidates.append((other_person, other_person.weekend_shifts))
+
+                if candidates:
+                    # Sort by weekend shifts (prefer those with fewer)
+                    candidates.sort(key=lambda x: x[1])
+                    # Try each candidate until one works
+                    for best_candidate, _ in candidates:
+                        if self._perform_swap(person, best_candidate, d, shift_type):
+                            fixed_any = True
+                            break
+                    if fixed_any:
+                        break  # Restart the loop to recheck violations
+
+            if not fixed_any:
+                # Could not fix any violation, give up
+                break
+
     def _optimize_schedule(self):
         """
         Post-generation optimization: try to balance weekend, night, and total shifts
         by swapping assignments between people.
         """
+        # FIRST PRIORITY: Fix any hard constraint violations (holiday workers with weekend shifts)
+        self._fix_holiday_worker_weekend_violations()
+
         max_iterations = 100  # Increase iterations for better balancing
         improved = True
         iteration = 0
@@ -818,7 +921,8 @@ class Scheduler:
         Only considers non-holiday workers (holiday workers cannot work weekends).
         """
         # Only consider non-holiday workers for weekend balancing
-        non_holiday_staff = [(name, p) for name, p in self.staff.items() if p.holiday_shifts == 0]
+        non_holiday_staff = [(name, p) for name, p in self.staff.items()
+                            if not self.is_holiday_worker(p) and p.holiday_shifts == 0]
         if not non_holiday_staff:
             return False
 
@@ -859,14 +963,14 @@ class Scheduler:
 
                 for low_name, low_person in candidates:
                     # Skip holiday workers (they cannot work weekends)
-                    if low_person.holiday_shifts > 0:
+                    if self.is_holiday_worker(low_person) or low_person.holiday_shifts > 0:
                         continue
 
                     # Check if low_person can take this shift
                     if self._can_swap_shift(high_person, low_person, d, shift_type):
                         # Perform the swap
-                        self._perform_swap(high_person, low_person, d, shift_type)
-                        return True
+                        if self._perform_swap(high_person, low_person, d, shift_type):
+                            return True
 
         return False
 
@@ -916,8 +1020,8 @@ class Scheduler:
                     low_person = self.staff[low_name]
 
                     if self._can_swap_shift(high_person, low_person, d, shift_type):
-                        self._perform_swap(high_person, low_person, d, shift_type)
-                        return True
+                        if self._perform_swap(high_person, low_person, d, shift_type):
+                            return True
 
         return False
 
@@ -943,8 +1047,9 @@ class Scheduler:
             high_person = self.staff[high_name]
 
             # Check weekend burden (only among non-holiday workers)
-            non_holiday = [p for p in self.staff.values() if p.holiday_shifts == 0]
-            if non_holiday and high_person.holiday_shifts == 0:
+            non_holiday = [p for p in self.staff.values()
+                          if not self.is_holiday_worker(p) and p.holiday_shifts == 0]
+            if non_holiday and not self.is_holiday_worker(high_person) and high_person.holiday_shifts == 0:
                 max_weekend = max(p.weekend_shifts for p in non_holiday)
                 if high_person.weekend_shifts == max_weekend and max_weekend > 0:
                     # This person has max total AND max weekend - try to swap a weekend shift
@@ -957,15 +1062,15 @@ class Scheduler:
                         for other_name, other_person in self.staff.items():
                             if other_name == high_name:
                                 continue
-                            if other_person.holiday_shifts > 0:
+                            if self.is_holiday_worker(other_person) or other_person.holiday_shifts > 0:
                                 continue  # Don't swap to holiday workers
                             if other_person.weekend_shifts >= high_person.weekend_shifts:
                                 continue  # Must have fewer weekends
                             if get_norm_total(other_person) >= max_total:
                                 continue  # Must have fewer total shifts
                             if self._can_swap_shift(high_person, other_person, d, shift_type):
-                                self._perform_swap(high_person, other_person, d, shift_type)
-                                return True
+                                if self._perform_swap(high_person, other_person, d, shift_type):
+                                    return True
 
             # Check night burden (only among night-capable)
             if high_person.can_do_night:
@@ -997,8 +1102,8 @@ class Scheduler:
                                 if get_norm_total(other_person) >= max_total:
                                     continue  # Must have fewer total shifts
                                 if self._can_swap_shift(high_person, other_person, d, shift_type):
-                                    self._perform_swap(high_person, other_person, d, shift_type)
-                                    return True
+                                    if self._perform_swap(high_person, other_person, d, shift_type):
+                                        return True
 
         return False
 
@@ -1053,8 +1158,8 @@ class Scheduler:
 
                         # Only swap if it improves or maintains balance
                         if new_high_norm >= new_low_norm - 1:
-                            self._perform_swap(high_person, low_person, d, shift_type)
-                            return True
+                            if self._perform_swap(high_person, low_person, d, shift_type):
+                                return True
 
         return False
 
@@ -1149,7 +1254,7 @@ class Scheduler:
                 return False
 
         # Don't swap to holiday workers for weekend shifts
-        if self.is_weekend(d) and to_person.holiday_shifts > 0:
+        if self.is_weekend(d) and (self.is_holiday_worker(to_person) or to_person.holiday_shifts > 0):
             return False
 
         # Weekend constraints
@@ -1173,8 +1278,13 @@ class Scheduler:
 
         return True
 
-    def _perform_swap(self, from_person: Person, to_person: Person, d: date, shift_type: ShiftType):
-        """Perform the actual swap of a shift from one person to another."""
+    def _perform_swap(self, from_person: Person, to_person: Person, d: date, shift_type: ShiftType) -> bool:
+        """
+        Perform the actual swap of a shift from one person to another.
+        Returns True if successful, False if blocked by hard constraint.
+        """
+        # First try to assign to to_person (check if it would be blocked)
+        # We need to temporarily remove from from_person to allow the assignment
         # Remove from from_person
         del self.schedule[(from_person.name, d)]
         from_person.assigned_dates.discard(d)
@@ -1196,7 +1306,30 @@ class Scheduler:
             from_person.holiday_shifts -= 1
 
         # Add to to_person
-        self._assign_shift(to_person, d, shift_type)
+        if self._assign_shift(to_person, d, shift_type):
+            return True
+
+        # Assignment failed, rollback the removal
+        self.schedule[(from_person.name, d)] = shift_type
+        from_person.assigned_dates.add(d)
+        from_person.total_shifts += 1
+        from_person.weighted_total += SHIFT_WEIGHTS[shift_type]
+
+        if shift_type == ShiftType.DAY:
+            from_person.day_shifts += 1
+        elif shift_type == ShiftType.NIGHT:
+            from_person.night_shifts += 1
+        elif shift_type == ShiftType.FULL_24H:
+            from_person.shifts_24h += 1
+            from_person.day_shifts += 1
+            from_person.night_shifts += 1
+
+        if self.is_weekend(d):
+            from_person.weekend_shifts += 1
+        if self.is_holiday(d):
+            from_person.holiday_shifts += 1
+
+        return False
 
     def _calculate_fairness_score(self) -> float:
         """
@@ -1219,7 +1352,8 @@ class Scheduler:
 
         # Filter staff by capability/situation for fair comparison
         night_capable = [p for p in self.staff.values() if p.can_do_night]
-        non_holiday_workers = [p for p in self.staff.values() if p.holiday_shifts == 0]
+        non_holiday_workers = [p for p in self.staff.values()
+                              if not self.is_holiday_worker(p) and p.holiday_shifts == 0]
 
         # Weekend: only compare among non-holiday workers
         weekend_shifts = [p.weekend_shifts for p in non_holiday_workers] if non_holiday_workers else []
@@ -1261,8 +1395,8 @@ class Scheduler:
 
         # Heavy penalty if holiday workers have weekend shifts
         for p in self.staff.values():
-            if p.holiday_shifts > 0 and p.weekend_shifts > 0:
-                score += 200  # Strong penalty
+            if (self.is_holiday_worker(p) or p.holiday_shifts > 0) and p.weekend_shifts > 0:
+                score += 10000  # Extremely strong penalty - this should never happen
 
         # Penalty for multiple 24h shifts per person
         for p in self.staff.values():
@@ -1298,10 +1432,15 @@ class Scheduler:
 
             # Fill Day shifts
             for _ in range(max(0, day_slots_needed)):
-                candidate = self._select_best_candidate(
-                    d, ShiftType.DAY, exclude=assigned_today
-                )
-                if candidate:
+                # Try multiple candidates in case some are blocked by hard constraints
+                tried = set()
+                while True:
+                    candidate = self._select_best_candidate(
+                        d, ShiftType.DAY, exclude=assigned_today | tried
+                    )
+                    if not candidate:
+                        break
+
                     # Check if we should consider 24h shift
                     # IMPORTANT: Do NOT assign 24h shifts on weekends (unfair double burden)
                     consider_24h = (
@@ -1313,26 +1452,39 @@ class Scheduler:
                     if consider_24h:
                         # Find best candidate specifically for 24h (considers 24h fairness)
                         best_24h = self._select_best_candidate(
-                            d, ShiftType.FULL_24H, exclude=assigned_today
+                            d, ShiftType.FULL_24H, exclude=assigned_today | tried
                         )
                         if best_24h and best_24h.shifts_24h == 0:
                             # Only assign 24h if this person hasn't had one yet
-                            self._assign_shift(best_24h, d, ShiftType.FULL_24H)
-                            assigned_today.add(best_24h.name)
-                            night_slots_needed -= 1
-                            continue
+                            if self._assign_shift(best_24h, d, ShiftType.FULL_24H):
+                                assigned_today.add(best_24h.name)
+                                night_slots_needed -= 1
+                                break
+                            else:
+                                tried.add(best_24h.name)
+                                continue
 
-                    self._assign_shift(candidate, d, ShiftType.DAY)
-                    assigned_today.add(candidate.name)
+                    if self._assign_shift(candidate, d, ShiftType.DAY):
+                        assigned_today.add(candidate.name)
+                        break
+                    else:
+                        tried.add(candidate.name)
 
             # Fill Night shifts
             for _ in range(max(0, night_slots_needed)):
-                candidate = self._select_best_candidate(
-                    d, ShiftType.NIGHT, exclude=assigned_today
-                )
-                if candidate:
-                    self._assign_shift(candidate, d, ShiftType.NIGHT)
-                    assigned_today.add(candidate.name)
+                # Try multiple candidates in case some are blocked by hard constraints
+                tried = set()
+                while True:
+                    candidate = self._select_best_candidate(
+                        d, ShiftType.NIGHT, exclude=assigned_today | tried
+                    )
+                    if not candidate:
+                        break
+                    if self._assign_shift(candidate, d, ShiftType.NIGHT):
+                        assigned_today.add(candidate.name)
+                        break
+                    else:
+                        tried.add(candidate.name)
 
         return self._validate_coverage()
 
@@ -1357,6 +1509,57 @@ class Scheduler:
                 return False
 
         return True
+
+    def _validate_hard_constraints(self) -> Tuple[bool, List[str]]:
+        """
+        Validate that all HARD constraints are satisfied.
+        Returns (is_valid, list_of_violations).
+
+        Hard constraints that MUST be satisfied:
+        1. Holiday workers CANNOT have weekend shifts
+        2. Max 1 shift per weekend per person
+        3. Thursday night workers should not work that weekend
+        """
+        violations = []
+
+        # HARD CONSTRAINT 1: Holiday workers CANNOT have weekend shifts
+        for person in self.staff.values():
+            is_holiday_worker = self.is_holiday_worker(person) or person.holiday_shifts > 0
+            if is_holiday_worker and person.weekend_shifts > 0:
+                violations.append(
+                    f"VIOLATION: {person.name} is a holiday worker but has {person.weekend_shifts} weekend shift(s)"
+                )
+
+        # HARD CONSTRAINT 2: Max 1 shift per weekend per person
+        for person in self.staff.values():
+            # Group weekend shifts by week
+            weekend_dates = [
+                d for (name, d), shift_type in self.schedule.items()
+                if name == person.name and self.is_weekend(d)
+            ]
+            # Check for same-weekend duplicates (Sat+Sun of same week)
+            for d in weekend_dates:
+                pair = self._get_weekend_pair(d)
+                if pair and pair in weekend_dates:
+                    violations.append(
+                        f"VIOLATION: {person.name} has shifts on both days of weekend ({d}, {pair})"
+                    )
+                    break  # Only report once per person
+
+        # HARD CONSTRAINT 3: Thursday night workers should not work that weekend
+        for person in self.staff.values():
+            for d in self.thursdays:
+                shift = self.schedule.get((person.name, d))
+                if shift in (ShiftType.NIGHT, ShiftType.FULL_24H):
+                    # Check if they work the following weekend
+                    sat = d + timedelta(days=2)
+                    sun = d + timedelta(days=3)
+                    if sat in person.assigned_dates or sun in person.assigned_dates:
+                        violations.append(
+                            f"VIOLATION: {person.name} has Thursday night ({d}) but also works weekend ({sat}/{sun})"
+                        )
+
+        return len(violations) == 0, violations
 
     def get_schedule_dict(self) -> Dict[Tuple[str, date], str]:
         """Return schedule as dict with string shift types."""
@@ -1452,13 +1655,23 @@ class Scheduler:
             replacement = self._find_replacement(d, shift_type, leave_person_name)
 
             if replacement:
-                self._assign_shift(replacement, d, shift_type)
-                changes.append({
-                    "date": d,
-                    "shift_type": shift_type.value,
-                    "from": leave_person_name,
-                    "to": replacement.name,
-                })
+                if self._assign_shift(replacement, d, shift_type):
+                    changes.append({
+                        "date": d,
+                        "shift_type": shift_type.value,
+                        "from": leave_person_name,
+                        "to": replacement.name,
+                    })
+                else:
+                    # Assignment blocked by hard constraint, restore original
+                    self._assign_shift(leave_person, d, shift_type)
+                    changes.append({
+                        "date": d,
+                        "shift_type": shift_type.value,
+                        "from": leave_person_name,
+                        "to": leave_person_name,
+                        "warning": "Replacement blocked by constraint - original kept",
+                    })
             else:
                 # This should NEVER happen - restore the original assignment
                 # to maintain coverage
@@ -1535,7 +1748,7 @@ class Scheduler:
                 continue
 
             # HARD CONSTRAINT: Holiday workers CANNOT work weekends (even in FORCE mode)
-            if self.is_weekend(d) and person.holiday_shifts > 0:
+            if self.is_weekend(d) and (self.is_holiday_worker(person) or person.holiday_shifts > 0):
                 continue
 
             # Skip if already assigned this day (can't do two shifts same day)
@@ -1579,7 +1792,7 @@ class Scheduler:
                 continue
 
             # HARD CONSTRAINT: Holiday workers CANNOT work weekends (even in ABSOLUTE FORCE mode)
-            if self.is_weekend(d) and person.holiday_shifts > 0:
+            if self.is_weekend(d) and (self.is_holiday_worker(person) or person.holiday_shifts > 0):
                 continue
 
             if d in person.assigned_dates:
