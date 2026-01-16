@@ -368,22 +368,15 @@ class Scheduler:
                     if others_with_fewer:
                         return False, "Night fairness: others have fewer night shifts"
 
-        # HARD CONSTRAINT: Weekend fairness - max difference of 1
-        # Only compare among "comparable" people (exclude holiday workers from comparison)
+        # HARD CONSTRAINT: Holiday workers CANNOT work weekends (strict rule)
         if self.is_weekend(d):
-            # Block holiday workers from weekend if others available (highest priority)
             if person.holiday_shifts > 0:
-                others_no_holiday = [
-                    p for p in self.staff.values()
-                    if p.name != person.name
-                    and p.holiday_shifts == 0
-                    and self._basic_can_assign(p, d, shift_type)
-                ]
-                if others_no_holiday:
-                    return False, "Holiday worker should not work weekend"
+                return False, "Holiday worker cannot work weekend (strict rule)"
 
+        # HARD CONSTRAINT: Weekend fairness - max difference of 1
+        # Only compare among non-holiday workers (holiday workers are excluded from weekends)
+        if self.is_weekend(d):
             # Weekend fairness only among non-holiday workers
-            # (holiday workers are expected to have fewer weekends - that's fair compensation)
             comparable_staff = [p for p in self.staff.values() if p.holiday_shifts == 0]
             if comparable_staff and person.holiday_shifts == 0:
                 min_weekend = min(p.weekend_shifts for p in comparable_staff)
@@ -730,7 +723,7 @@ class Scheduler:
                 if d in self.dates:
                     self._assign_shift(person, d, shift_type)
 
-    def generate_schedule(self, num_attempts: int = 20) -> bool:
+    def generate_schedule(self, num_attempts: int = 50) -> bool:
         """
         Generate the monthly schedule by trying multiple times and keeping the best.
         Returns True if successful, False if coverage requirements cannot be met.
@@ -790,7 +783,7 @@ class Scheduler:
         Post-generation optimization: try to balance weekend, night, and total shifts
         by swapping assignments between people.
         """
-        max_iterations = 50  # Prevent infinite loops
+        max_iterations = 100  # Increase iterations for better balancing
         improved = True
         iteration = 0
 
@@ -798,9 +791,11 @@ class Scheduler:
             improved = False
             iteration += 1
 
-            # Try to balance weekend shifts
-            if self._try_balance_weekend_shifts():
-                improved = True
+            # Priority 1: Weekend balance (most important for fairness)
+            # Try multiple times per iteration
+            for _ in range(3):
+                if self._try_balance_weekend_shifts():
+                    improved = True
 
             # Try to balance night shifts
             if self._try_balance_night_shifts():
@@ -815,11 +810,15 @@ class Scheduler:
                 improved = True
 
     def _try_balance_weekend_shifts(self) -> bool:
-        """Try to swap weekend shifts from high to low count people."""
-        weekend_counts = [(name, p.weekend_shifts) for name, p in self.staff.items()]
-        if not weekend_counts:
+        """Try to swap weekend shifts from high to low count people.
+        Only considers non-holiday workers (holiday workers cannot work weekends).
+        """
+        # Only consider non-holiday workers for weekend balancing
+        non_holiday_staff = [(name, p) for name, p in self.staff.items() if p.holiday_shifts == 0]
+        if not non_holiday_staff:
             return False
 
+        weekend_counts = [(name, p.weekend_shifts) for name, p in non_holiday_staff]
         max_weekend = max(c[1] for c in weekend_counts)
         min_weekend = min(c[1] for c in weekend_counts)
 
@@ -827,9 +826,15 @@ class Scheduler:
         if max_weekend - min_weekend <= 1:
             return False
 
-        # Find people with max and min weekend shifts
-        high_people = [name for name, count in weekend_counts if count == max_weekend]
-        low_people = [name for name, count in weekend_counts if count == min_weekend]
+        # Find people with more than min+1 weekend shifts (need to reduce)
+        high_people = [name for name, count in weekend_counts if count > min_weekend + 1]
+        # Find people with fewer weekend shifts who can receive more
+        low_people = [name for name, count in weekend_counts if count < max_weekend - 1]
+
+        if not high_people:
+            high_people = [name for name, count in weekend_counts if count == max_weekend]
+        if not low_people:
+            low_people = [name for name, count in weekend_counts if count == min_weekend]
 
         # Try to find a swap
         for high_name in high_people:
@@ -842,9 +847,16 @@ class Scheduler:
             ]
 
             for d, shift_type in weekend_shifts:
-                # Try to find someone with fewer weekend shifts who can take this
-                for low_name in low_people:
-                    low_person = self.staff[low_name]
+                # Try ALL people with fewer weekend shifts (not just minimum)
+                candidates = sorted(
+                    [(name, p) for name, p in non_holiday_staff if p.weekend_shifts < high_person.weekend_shifts],
+                    key=lambda x: x[1].weekend_shifts
+                )
+
+                for low_name, low_person in candidates:
+                    # Skip holiday workers (they cannot work weekends)
+                    if low_person.holiday_shifts > 0:
+                        continue
 
                     # Check if low_person can take this shift
                     if self._can_swap_shift(high_person, low_person, d, shift_type):
@@ -1232,7 +1244,8 @@ class Scheduler:
 
         # Heavy penalty if range > 1 (only for comparable groups)
         score = 0
-        score += weekend_range * 100 + (50 if weekend_range > 1 else 0)
+        # Weekend balance is most critical - exponential penalty for imbalance
+        score += weekend_range * 200 + (weekend_range ** 2 * 100 if weekend_range > 1 else 0)
         score += night_range * 80 + (40 if night_range > 1 else 0)
         score += day_range * 60 + (30 if day_range > 1 else 0)
         score += total_range * 40
