@@ -636,6 +636,10 @@ class Scheduler:
         if shift_type == ShiftType.FULL_24H and not person.can_do_24h:
             return False
 
+        # HARD CONSTRAINT: Holiday workers CANNOT work weekends (even in emergency)
+        if self.is_weekend(d) and person.holiday_shifts > 0:
+            return False
+
         # Emergency gap rules - check against ALL assigned shifts, not just last
         # Use emergency gap (3 days) for night-to-night instead of normal (5 days)
         if shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H):
@@ -1530,6 +1534,10 @@ class Scheduler:
             if shift_type == ShiftType.FULL_24H and not person.can_do_24h:
                 continue
 
+            # HARD CONSTRAINT: Holiday workers CANNOT work weekends (even in FORCE mode)
+            if self.is_weekend(d) and person.holiday_shifts > 0:
+                continue
+
             # Skip if already assigned this day (can't do two shifts same day)
             if d in person.assigned_dates:
                 continue
@@ -1568,6 +1576,10 @@ class Scheduler:
             if shift_type == ShiftType.NIGHT and not person.can_do_night:
                 continue
             if shift_type == ShiftType.FULL_24H and not person.can_do_24h:
+                continue
+
+            # HARD CONSTRAINT: Holiday workers CANNOT work weekends (even in ABSOLUTE FORCE mode)
+            if self.is_weekend(d) and person.holiday_shifts > 0:
                 continue
 
             if d in person.assigned_dates:
