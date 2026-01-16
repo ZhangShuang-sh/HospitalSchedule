@@ -764,14 +764,25 @@ class Scheduler:
                 if d in self.dates:
                     self._assign_shift(person, d, shift_type)
 
-    def generate_schedule(self, num_attempts: int = 50) -> bool:
+    def generate_schedule(self, num_attempts: int = 100) -> bool:
         """
-        Generate the monthly schedule by trying multiple times and keeping the best.
+        Generate the monthly schedule using Multi-Stage Assignment approach.
+
+        This approach avoids infinite loops by assigning shifts in a specific order:
+        Phase 0: Initialize - identify holiday workers and weekend-eligible staff
+        Phase 1: Assign ALL weekend shifts FIRST (critical for avoiding conflicts)
+        Phase 2: Assign Thursday night shifts (compensation rule)
+        Phase 3: Fill remaining weekday slots
+        Phase 4: Validate and retry if needed (no swapping loops)
+
         Returns True if successful, False if coverage requirements cannot be met.
         """
         best_schedule = None
         best_stats = None
         best_fairness_score = float('inf')
+
+        # Track fairness relaxation level (start strict, relax if needed)
+        max_weekend_diff = 1  # Start with strict fairness
 
         for attempt in range(num_attempts):
             # Reset all stats
@@ -780,27 +791,52 @@ class Scheduler:
 
             self.schedule = {}
 
-            # Process fixed assignments first
+            # Seed randomization for variety between attempts
+            random.seed(attempt * 42 + random.randint(0, 1000))
+
+            # ========== PHASE 0: INITIALIZATION ==========
+            # Process fixed assignments first (holidays, etc.)
             self._process_fixed_assignments()
 
-            # Generate one schedule attempt
-            self._generate_single_schedule()
+            # Identify weekend-eligible staff (exclude holiday workers)
+            weekend_eligible = [
+                p for p in self.staff.values()
+                if not self.is_holiday_worker(p) and p.holiday_shifts == 0
+            ]
 
-            # Validate coverage
+            if not weekend_eligible:
+                # No one eligible for weekends - this is a problem
+                continue
+
+            # ========== PHASE 1: ASSIGN WEEKENDS FIRST ==========
+            phase1_success = self._phase1_assign_weekends(
+                weekend_eligible, max_weekend_diff
+            )
+            if not phase1_success:
+                # Relax fairness constraint after many failures
+                if attempt > 0 and attempt % 20 == 0 and max_weekend_diff < 3:
+                    max_weekend_diff += 1
+                continue
+
+            # ========== PHASE 2: ASSIGN THURSDAY NIGHTS ==========
+            phase2_success = self._phase2_assign_thursday_nights()
+            if not phase2_success:
+                continue
+
+            # ========== PHASE 3: FILL REMAINING WEEKDAYS ==========
+            phase3_success = self._phase3_fill_weekdays()
+            if not phase3_success:
+                continue
+
+            # ========== PHASE 4: VALIDATION ==========
             if not self._validate_coverage():
                 continue
 
-            # Post-generation optimization: try to balance shifts
-            self._optimize_schedule()
-
-            # CRITICAL: Validate hard constraints AFTER optimization
-            # If hard constraints are violated, reject this schedule entirely
             is_valid, violations = self._validate_hard_constraints()
             if not is_valid:
-                # This schedule violates hard constraints, skip it
                 continue
 
-            # Calculate fairness score (lower is better)
+            # Calculate fairness score
             score = self._calculate_fairness_score()
 
             if score < best_fairness_score:
@@ -812,6 +848,10 @@ class Scheduler:
                     p.weighted_total, p.last_day_shift, p.last_night_shift,
                     set(p.assigned_dates)
                 ) for name, p in self.staff.items()}
+
+                # If we found a perfect score, stop early
+                if score == 0:
+                    break
 
         # Restore the best schedule
         if best_schedule:
@@ -826,598 +866,257 @@ class Scheduler:
 
         return False
 
-    def _fix_holiday_worker_weekend_violations(self):
+    # ==================== MULTI-STAGE SCHEDULING METHODS ====================
+
+    def _phase1_assign_weekends(
+        self, weekend_eligible: List[Person], max_diff: int = 1
+    ) -> bool:
         """
-        CRITICAL: Fix any cases where holiday workers have weekend shifts.
-        This is a HARD constraint that must be satisfied.
-        Try to swap these weekend shifts to non-holiday workers.
+        PHASE 1: Assign ALL weekend shifts FIRST.
+
+        This is the critical step that prevents conflicts between holiday workers
+        and weekend assignments. By assigning weekends first, we ensure:
+        1. Holiday workers are never considered for weekend shifts
+        2. Weekend fairness is achieved from the start
+        3. No complex swapping is needed later
+
+        Args:
+            weekend_eligible: List of staff members eligible for weekend shifts
+            max_diff: Maximum allowed difference in weekend shifts (default 1)
+
+        Returns:
+            True if successful, False if constraints cannot be satisfied
         """
-        max_attempts = 50  # Limit attempts to avoid infinite loop
+        # Get all weekend dates (exclude holidays that fall on weekends)
+        weekend_dates = sorted([d for d in self.weekends if d not in self.holidays])
 
-        for attempt in range(max_attempts):
-            # Find holiday workers with weekend shifts
-            violations = []
-            for person in self.staff.values():
-                is_holiday_worker = self.is_holiday_worker(person) or person.holiday_shifts > 0
-                if is_holiday_worker and person.weekend_shifts > 0:
-                    # Find their weekend shifts
-                    weekend_shifts = [
-                        (d, shift_type) for (name, d), shift_type in self.schedule.items()
-                        if name == person.name and self.is_weekend(d)
-                    ]
-                    for d, shift_type in weekend_shifts:
-                        violations.append((person, d, shift_type))
+        if not weekend_dates:
+            return True  # No weekends to assign
 
-            if not violations:
-                return  # No violations, done
+        # Calculate target weekend shifts per person
+        total_weekend_slots = len(weekend_dates) * (self.day_shifts_per_day + self.night_shifts_per_day)
+        target_per_person = total_weekend_slots / len(weekend_eligible) if weekend_eligible else 0
 
-            # Try to fix each violation
-            fixed_any = False
-            for person, d, shift_type in violations:
-                # Find a non-holiday worker who can take this shift
-                candidates = []
-                for other_name, other_person in self.staff.items():
-                    if other_name == person.name:
-                        continue
-                    # Must not be a holiday worker
-                    if self.is_holiday_worker(other_person) or other_person.holiday_shifts > 0:
-                        continue
-                    # Must be able to take this shift
-                    if self._can_swap_shift(person, other_person, d, shift_type):
-                        # Prefer people with fewer weekend shifts
-                        candidates.append((other_person, other_person.weekend_shifts))
+        # Group weekends by Sat/Sun pairs
+        weekend_pairs = []
+        processed = set()
+        for d in weekend_dates:
+            if d in processed:
+                continue
+            pair = self._get_weekend_pair(d)
+            if pair and pair in weekend_dates:
+                weekend_pairs.append((min(d, pair), max(d, pair)))
+                processed.add(d)
+                processed.add(pair)
+            else:
+                weekend_pairs.append((d, None))
+                processed.add(d)
 
-                if candidates:
-                    # Sort by weekend shifts (prefer those with fewer)
-                    candidates.sort(key=lambda x: x[1])
-                    # Try each candidate until one works
-                    for best_candidate, _ in candidates:
-                        if self._perform_swap(person, best_candidate, d, shift_type):
-                            fixed_any = True
-                            break
-                    if fixed_any:
-                        break  # Restart the loop to recheck violations
+        # Assign weekend shifts - iterate through each weekend day
+        for d in weekend_dates:
+            if self.is_holiday(d):
+                continue
 
-            if not fixed_any:
-                # Could not fix any violation, give up
-                break
+            # Check if already assigned via fixed assignments
+            day_slots = self.day_shifts_per_day
+            night_slots = self.night_shifts_per_day
 
-    def _optimize_schedule(self):
-        """
-        Post-generation optimization: try to balance weekend, night, and total shifts
-        by swapping assignments between people.
-        """
-        # FIRST PRIORITY: Fix any hard constraint violations (holiday workers with weekend shifts)
-        self._fix_holiday_worker_weekend_violations()
+            for (name, assigned_date), shift_type in self.schedule.items():
+                if assigned_date == d:
+                    if shift_type in (ShiftType.DAY, ShiftType.FULL_24H):
+                        day_slots -= 1
+                    if shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H):
+                        night_slots -= 1
 
-        max_iterations = 100  # Increase iterations for better balancing
-        improved = True
-        iteration = 0
-
-        while improved and iteration < max_iterations:
-            improved = False
-            iteration += 1
-
-            # Priority 1: Weekend balance (most important for fairness)
-            # Try multiple times per iteration
-            for _ in range(3):
-                if self._try_balance_weekend_shifts():
-                    improved = True
-
-            # Try to balance night shifts
-            if self._try_balance_night_shifts():
-                improved = True
-
-            # Try to reduce burden on high-total people
-            if self._try_balance_high_total_burden():
-                improved = True
-
-            # Try to balance total shifts (ensure difference <= 1)
-            if self._try_balance_total_shifts():
-                improved = True
-
-    def _try_balance_weekend_shifts(self) -> bool:
-        """Try to swap weekend shifts from high to low count people.
-        Only considers non-holiday workers (holiday workers cannot work weekends).
-        """
-        # Only consider non-holiday workers for weekend balancing
-        non_holiday_staff = [(name, p) for name, p in self.staff.items()
-                            if not self.is_holiday_worker(p) and p.holiday_shifts == 0]
-        if not non_holiday_staff:
-            return False
-
-        weekend_counts = [(name, p.weekend_shifts) for name, p in non_holiday_staff]
-        max_weekend = max(c[1] for c in weekend_counts)
-        min_weekend = min(c[1] for c in weekend_counts)
-
-        # If difference <= 1, no need to balance
-        if max_weekend - min_weekend <= 1:
-            return False
-
-        # Find people with more than min+1 weekend shifts (need to reduce)
-        high_people = [name for name, count in weekend_counts if count > min_weekend + 1]
-        # Find people with fewer weekend shifts who can receive more
-        low_people = [name for name, count in weekend_counts if count < max_weekend - 1]
-
-        if not high_people:
-            high_people = [name for name, count in weekend_counts if count == max_weekend]
-        if not low_people:
-            low_people = [name for name, count in weekend_counts if count == min_weekend]
-
-        # Try to find a swap
-        for high_name in high_people:
-            high_person = self.staff[high_name]
-
-            # Find weekend shifts assigned to this person
-            weekend_shifts = [
-                (d, shift_type) for (name, d), shift_type in self.schedule.items()
-                if name == high_name and self.is_weekend(d)
-            ]
-
-            for d, shift_type in weekend_shifts:
-                # Try ALL people with fewer weekend shifts (not just minimum)
-                candidates = sorted(
-                    [(name, p) for name, p in non_holiday_staff if p.weekend_shifts < high_person.weekend_shifts],
-                    key=lambda x: x[1].weekend_shifts
+            # Assign day shifts
+            for _ in range(max(0, day_slots)):
+                candidate = self._select_weekend_candidate(
+                    d, ShiftType.DAY, weekend_eligible, max_diff
                 )
+                if candidate:
+                    if not self._assign_shift(candidate, d, ShiftType.DAY):
+                        return False  # Hard constraint violation
+                else:
+                    return False  # No valid candidate
 
-                for low_name, low_person in candidates:
-                    # Skip holiday workers (they cannot work weekends)
-                    if self.is_holiday_worker(low_person) or low_person.holiday_shifts > 0:
-                        continue
-
-                    # Check if low_person can take this shift
-                    if self._can_swap_shift(high_person, low_person, d, shift_type):
-                        # Perform the swap
-                        if self._perform_swap(high_person, low_person, d, shift_type):
-                            return True
-
-        return False
-
-    def _try_balance_night_shifts(self) -> bool:
-        """Try to swap night shifts from high to low count people."""
-        total_days = len(self.dates)
-
-        # Only consider night-capable staff
-        night_capable = [(name, p) for name, p in self.staff.items() if p.can_do_night]
-        if not night_capable:
-            return False
-
-        # Normalize for target ratio
-        def get_norm_night(p):
-            ratio = p.get_target_ratio(total_days)
-            return p.night_shifts * 2 if ratio == 0.5 else p.night_shifts
-
-        night_counts = [(name, get_norm_night(p)) for name, p in night_capable]
-        max_night = max(c[1] for c in night_counts)
-        min_night = min(c[1] for c in night_counts)
-
-        # If difference <= 1, no need to balance
-        if max_night - min_night <= 1:
-            return False
-
-        # Find people with max and min night shifts
-        high_people = [name for name, count in night_counts if count == max_night]
-        low_people = [name for name, count in night_counts if count == min_night]
-
-        # Try to find a swap
-        for high_name in high_people:
-            high_person = self.staff[high_name]
-
-            # Find night shifts assigned to this person
-            night_shifts = [
-                (d, shift_type) for (name, d), shift_type in self.schedule.items()
-                if name == high_name and shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H)
-            ]
-
-            for d, shift_type in night_shifts:
-                # Skip weekends for 24h swaps (too complex)
-                if shift_type == ShiftType.FULL_24H:
-                    continue
-
-                # Try to find someone with fewer night shifts who can take this
-                for low_name in low_people:
-                    low_person = self.staff[low_name]
-
-                    if self._can_swap_shift(high_person, low_person, d, shift_type):
-                        if self._perform_swap(high_person, low_person, d, shift_type):
-                            return True
-
-        return False
-
-    def _try_balance_high_total_burden(self) -> bool:
-        """
-        Try to reduce night/weekend burden for people with the most total shifts.
-        If someone has max total shifts AND max nights/weekends, try to swap some away.
-        """
-        total_days = len(self.dates)
-
-        # Normalize total shifts for target ratio comparison
-        def get_norm_total(p):
-            ratio = p.get_target_ratio(total_days)
-            return p.total_shifts * 2 if ratio == 0.5 else p.total_shifts
-
-        # Find person(s) with max normalized total shifts
-        norm_totals = [(name, get_norm_total(p)) for name, p in self.staff.items()]
-        max_total = max(c[1] for c in norm_totals)
-        high_total_people = [name for name, count in norm_totals if count == max_total]
-
-        # For each high-total person, check if they also have max nights or weekends
-        for high_name in high_total_people:
-            high_person = self.staff[high_name]
-
-            # Check weekend burden (only among non-holiday workers)
-            non_holiday = [p for p in self.staff.values()
-                          if not self.is_holiday_worker(p) and p.holiday_shifts == 0]
-            if non_holiday and not self.is_holiday_worker(high_person) and high_person.holiday_shifts == 0:
-                max_weekend = max(p.weekend_shifts for p in non_holiday)
-                if high_person.weekend_shifts == max_weekend and max_weekend > 0:
-                    # This person has max total AND max weekend - try to swap a weekend shift
-                    weekend_shifts = [
-                        (d, shift_type) for (name, d), shift_type in self.schedule.items()
-                        if name == high_name and self.is_weekend(d)
-                    ]
-                    for d, shift_type in weekend_shifts:
-                        # Find someone with fewer weekends AND fewer total shifts
-                        for other_name, other_person in self.staff.items():
-                            if other_name == high_name:
-                                continue
-                            if self.is_holiday_worker(other_person) or other_person.holiday_shifts > 0:
-                                continue  # Don't swap to holiday workers
-                            if other_person.weekend_shifts >= high_person.weekend_shifts:
-                                continue  # Must have fewer weekends
-                            if get_norm_total(other_person) >= max_total:
-                                continue  # Must have fewer total shifts
-                            if self._can_swap_shift(high_person, other_person, d, shift_type):
-                                if self._perform_swap(high_person, other_person, d, shift_type):
-                                    return True
-
-            # Check night burden (only among night-capable)
-            if high_person.can_do_night:
-                night_capable = [p for p in self.staff.values() if p.can_do_night]
-                if night_capable:
-                    def get_norm_night(p):
-                        ratio = p.get_target_ratio(total_days)
-                        return p.night_shifts * 2 if ratio == 0.5 else p.night_shifts
-
-                    max_night = max(get_norm_night(p) for p in night_capable)
-                    if get_norm_night(high_person) == max_night and high_person.night_shifts > 0:
-                        # This person has max total AND max nights - try to swap a night shift
-                        night_shifts = [
-                            (d, shift_type) for (name, d), shift_type in self.schedule.items()
-                            if name == high_name and shift_type == ShiftType.NIGHT
-                        ]
-                        for d, shift_type in night_shifts:
-                            # Skip weekend nights (handled above)
-                            if self.is_weekend(d):
-                                continue
-                            # Find someone with fewer nights AND fewer total shifts
-                            for other_name, other_person in self.staff.items():
-                                if other_name == high_name:
-                                    continue
-                                if not other_person.can_do_night:
-                                    continue
-                                if get_norm_night(other_person) >= get_norm_night(high_person):
-                                    continue  # Must have fewer nights
-                                if get_norm_total(other_person) >= max_total:
-                                    continue  # Must have fewer total shifts
-                                if self._can_swap_shift(high_person, other_person, d, shift_type):
-                                    if self._perform_swap(high_person, other_person, d, shift_type):
-                                        return True
-
-        return False
-
-    def _try_balance_total_shifts(self) -> bool:
-        """
-        Try to balance total shifts so that the difference is at most 1.
-        Uses normalized shifts (accounting for target ratio - half-month people count as 2x).
-        """
-        total_days = len(self.dates)
-
-        # Normalize total shifts for target ratio comparison
-        def get_norm_total(p):
-            ratio = p.get_target_ratio(total_days)
-            return p.total_shifts * 2 if ratio == 0.5 else p.total_shifts
-
-        norm_totals = [(name, get_norm_total(p)) for name, p in self.staff.items()]
-        if not norm_totals:
-            return False
-
-        max_total = max(c[1] for c in norm_totals)
-        min_total = min(c[1] for c in norm_totals)
-
-        # If difference <= 1, no need to balance
-        if max_total - min_total <= 1:
-            return False
-
-        # Find people with max and min total shifts
-        high_people = [name for name, count in norm_totals if count == max_total]
-        low_people = [name for name, count in norm_totals if count == min_total]
-
-        # Try to find a swap: move a shift from high to low
-        for high_name in high_people:
-            high_person = self.staff[high_name]
-
-            # Get all shifts for this person, sorted by date
-            all_shifts = [
-                (d, shift_type) for (name, d), shift_type in self.schedule.items()
-                if name == high_name
-            ]
-            all_shifts.sort(key=lambda x: x[0])
-
-            for d, shift_type in all_shifts:
-                # Try to find someone with fewer total shifts who can take this
-                for low_name in low_people:
-                    low_person = self.staff[low_name]
-
-                    # Check if low_person can take this shift
-                    if self._can_swap_shift(high_person, low_person, d, shift_type):
-                        # Verify the swap would improve balance
-                        new_high_norm = get_norm_total(high_person) - (2 if high_person.get_target_ratio(total_days) == 0.5 else 1)
-                        new_low_norm = get_norm_total(low_person) + (2 if low_person.get_target_ratio(total_days) == 0.5 else 1)
-
-                        # Only swap if it improves or maintains balance
-                        if new_high_norm >= new_low_norm - 1:
-                            if self._perform_swap(high_person, low_person, d, shift_type):
-                                return True
-
-        return False
-
-    def _get_all_night_shifts(self, person: Person) -> List[date]:
-        """Get all night shift dates for a person from the schedule."""
-        night_dates = []
-        for (name, assigned_date), shift_type in self.schedule.items():
-            if name == person.name and shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H):
-                night_dates.append(assigned_date)
-        return sorted(night_dates)
-
-    def _get_all_day_shifts(self, person: Person) -> List[date]:
-        """Get all day shift dates for a person from the schedule."""
-        day_dates = []
-        for (name, assigned_date), shift_type in self.schedule.items():
-            if name == person.name and shift_type in (ShiftType.DAY, ShiftType.FULL_24H):
-                day_dates.append(assigned_date)
-        return sorted(day_dates)
-
-    def _check_night_gap_with_all_shifts(self, person: Person, d: date, min_gap: int) -> bool:
-        """Check if assigning a night shift on date d violates gap constraints with ALL existing night shifts."""
-        night_shifts = self._get_all_night_shifts(person)
-        for existing_date in night_shifts:
-            gap = abs((d - existing_date).days)
-            if gap > 0 and gap < min_gap:
-                return False  # Violation
-        return True  # No violation
-
-    def _check_day_gap_with_all_shifts(self, person: Person, d: date, min_gap: int) -> bool:
-        """Check if assigning a day shift on date d violates gap constraints with ALL existing day shifts."""
-        day_shifts = self._get_all_day_shifts(person)
-        for existing_date in day_shifts:
-            gap = abs((d - existing_date).days)
-            if gap > 0 and gap < min_gap:
-                return False  # Violation
-        return True  # No violation
-
-    def _check_night_to_day_gap(self, person: Person, d: date, min_gap: int) -> bool:
-        """Check if assigning a day shift on date d violates night-to-day gap constraints."""
-        night_shifts = self._get_all_night_shifts(person)
-        for night_date in night_shifts:
-            gap = (d - night_date).days
-            # Only check forward: day shift should not be within min_gap days AFTER a night shift
-            if gap > 0 and gap < min_gap:
-                return False  # Violation
-        return True  # No violation
-
-    def _check_reverse_night_to_day_gap(self, person: Person, night_date: date, min_gap: int) -> bool:
-        """Check if assigning a night shift would violate gaps with EXISTING day shifts.
-
-        When assigning a night shift, we need to ensure there are no day shifts
-        within the next min_gap days (since day shifts should not come too soon
-        after a night shift).
-        """
-        day_shifts = self._get_all_day_shifts(person)
-        for day_date in day_shifts:
-            gap = (day_date - night_date).days  # positive if day is after night
-            if gap > 0 and gap < min_gap:
-                return False  # Existing day shift is too soon after this night shift
-        return True  # No violation
-
-    def _can_swap_shift(self, from_person: Person, to_person: Person, d: date, shift_type: ShiftType) -> bool:
-        """Check if a shift can be swapped from one person to another."""
-        # Check basic capability
-        if shift_type == ShiftType.NIGHT and not to_person.can_do_night:
-            return False
-        if shift_type == ShiftType.FULL_24H and not to_person.can_do_24h:
-            return False
-
-        # Check if to_person is available on this date
-        if not to_person.is_available_on(d):
-            return False
-        if d in to_person.fixed_off_dates:
-            return False
-        if d in to_person.assigned_dates:
-            return False
-
-        # Check gap constraints for to_person - check against ALL shifts, not just last
-        if shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H):
-            if not self._check_night_gap_with_all_shifts(to_person, d, self.MIN_NIGHT_TO_NIGHT_GAP):
-                return False
-            # Also check reverse: existing day shifts that would be too close after this night
-            if not self._check_reverse_night_to_day_gap(to_person, d, self.MIN_NIGHT_TO_DAY_GAP):
-                return False
-
-        if shift_type in (ShiftType.DAY, ShiftType.FULL_24H):
-            # Night-to-Day gap check
-            if not self._check_night_to_day_gap(to_person, d, self.MIN_NIGHT_TO_DAY_GAP):
-                return False
-            # Day-to-Day gap check
-            if not self._check_day_gap_with_all_shifts(to_person, d, self.MIN_DAY_TO_DAY_GAP):
-                return False
-
-        # Don't swap to holiday workers for weekend shifts
-        if self.is_weekend(d) and (self.is_holiday_worker(to_person) or to_person.holiday_shifts > 0):
-            return False
-
-        # Weekend constraints
-        if self.is_weekend(d):
-            # Max 1 shift per weekend per person
-            other_day = self._get_weekend_pair(d)
-            if other_day and other_day in to_person.assigned_dates:
-                return False
-
-            # Thursday night compensation: if person has Thursday night, skip this weekend
-            if self._has_thursday_night_this_week(to_person, d):
-                return False
-
-        # Thursday night constraint (reverse check): if swapping Thursday night TO someone,
-        # check if they already have weekend shifts for that week
-        if d.weekday() == 3 and shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H):
-            sat = d + timedelta(days=2)
-            sun = d + timedelta(days=3)
-            if sat in to_person.assigned_dates or sun in to_person.assigned_dates:
-                return False
+            # Assign night shifts
+            for _ in range(max(0, night_slots)):
+                candidate = self._select_weekend_candidate(
+                    d, ShiftType.NIGHT, weekend_eligible, max_diff
+                )
+                if candidate:
+                    if not self._assign_shift(candidate, d, ShiftType.NIGHT):
+                        return False
+                else:
+                    return False
 
         return True
 
-    def _perform_swap(self, from_person: Person, to_person: Person, d: date, shift_type: ShiftType) -> bool:
+    def _select_weekend_candidate(
+        self, d: date, shift_type: ShiftType, eligible: List[Person], max_diff: int
+    ) -> Optional[Person]:
         """
-        Perform the actual swap of a shift from one person to another.
-        Returns True if successful, False if blocked by hard constraint.
+        Select the best candidate for a weekend shift.
+
+        Prioritizes:
+        1. Gap constraint satisfaction (CRITICAL)
+        2. Weekend fairness (max_diff constraint)
+        3. Lower total shifts
         """
-        # First try to assign to to_person (check if it would be blocked)
-        # We need to temporarily remove from from_person to allow the assignment
-        # Remove from from_person
-        del self.schedule[(from_person.name, d)]
-        from_person.assigned_dates.discard(d)
-        from_person.total_shifts -= 1
-        from_person.weighted_total -= SHIFT_WEIGHTS[shift_type]
+        candidates = []
 
-        if shift_type == ShiftType.DAY:
-            from_person.day_shifts -= 1
-        elif shift_type == ShiftType.NIGHT:
-            from_person.night_shifts -= 1
-        elif shift_type == ShiftType.FULL_24H:
-            from_person.shifts_24h -= 1
-            from_person.day_shifts -= 1
-            from_person.night_shifts -= 1
+        # Get current min weekend shifts among eligible
+        min_weekend = min(p.weekend_shifts for p in eligible) if eligible else 0
 
-        if self.is_weekend(d):
-            from_person.weekend_shifts -= 1
-        if self.is_holiday(d):
-            from_person.holiday_shifts -= 1
+        for person in eligible:
+            # Skip if already assigned this day
+            if d in person.assigned_dates:
+                continue
 
-        # Add to to_person
-        if self._assign_shift(to_person, d, shift_type):
-            return True
+            # Skip if already worked other day of this weekend
+            pair = self._get_weekend_pair(d)
+            if pair and pair in person.assigned_dates:
+                continue
 
-        # Assignment failed, rollback the removal
-        self.schedule[(from_person.name, d)] = shift_type
-        from_person.assigned_dates.add(d)
-        from_person.total_shifts += 1
-        from_person.weighted_total += SHIFT_WEIGHTS[shift_type]
+            # CRITICAL: Check gap constraints using _can_assign_shift
+            can_assign, _ = self._can_assign_shift(person, d, shift_type)
+            if not can_assign:
+                # Try emergency rules
+                if not self._emergency_can_assign(person, d, shift_type):
+                    continue
 
-        if shift_type == ShiftType.DAY:
-            from_person.day_shifts += 1
-        elif shift_type == ShiftType.NIGHT:
-            from_person.night_shifts += 1
-        elif shift_type == ShiftType.FULL_24H:
-            from_person.shifts_24h += 1
-            from_person.day_shifts += 1
-            from_person.night_shifts += 1
+            # Check fairness constraint
+            if person.weekend_shifts > min_weekend + max_diff:
+                continue
 
-        if self.is_weekend(d):
-            from_person.weekend_shifts += 1
-        if self.is_holiday(d):
-            from_person.holiday_shifts += 1
+            # Score: prefer fewer weekend shifts, then fewer total shifts
+            score = -person.weekend_shifts * 100 - person.total_shifts
+            # Add randomization for tie-breaking
+            score += random.uniform(0, 10)
+            candidates.append((person, score))
 
-        return False
+        if not candidates:
+            return None
 
-    def _calculate_fairness_score(self) -> float:
+        # Sort by score (higher is better)
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[0][0]
+
+    def _phase2_assign_thursday_nights(self) -> bool:
         """
-        Calculate a fairness score for the current schedule.
-        Lower score = more fair. Considers weekend, night, day, and total shift variance.
+        PHASE 2: Assign Thursday night shifts.
 
-        Special cases (allowed to have diff > 1):
-        - Weekend: only compare among non-holiday workers (holiday workers get fewer weekends)
-        - Day shifts: only compare among night-capable staff (non-night workers get more days)
-        - Night shifts: only compare among night-capable staff
+        Thursday night workers get Fri/Sat/Sun off as compensation.
+        Therefore, we must:
+        1. Only assign Thursday nights to people NOT working the upcoming weekend
+        2. Prioritize people with high night-shift load (give them long weekend)
+        3. Still respect all gap constraints
+
+        Returns:
+            True if successful, False if constraints cannot be satisfied
         """
-        import statistics
+        for thursday in self.thursdays:
+            if self.is_holiday(thursday):
+                continue
 
-        total_days = len(self.dates)
+            # Check if already assigned
+            night_slots = self.night_shifts_per_day
+            for (name, assigned_date), shift_type in self.schedule.items():
+                if assigned_date == thursday:
+                    if shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H):
+                        night_slots -= 1
 
-        # Get normalized values for comparison (accounting for target ratios)
-        def normalize(p, value):
-            ratio = p.get_target_ratio(total_days)
-            return value * 2 if ratio == 0.5 else value
+            if night_slots <= 0:
+                continue  # Already filled
 
-        # Filter staff by capability/situation for fair comparison
-        night_capable = [p for p in self.staff.values() if p.can_do_night]
-        non_holiday_workers = [p for p in self.staff.values()
-                              if not self.is_holiday_worker(p) and p.holiday_shifts == 0]
+            # Find candidates - must NOT work upcoming weekend
+            sat = thursday + timedelta(days=2)
+            sun = thursday + timedelta(days=3)
 
-        # Weekend: only compare among non-holiday workers
-        weekend_shifts = [p.weekend_shifts for p in non_holiday_workers] if non_holiday_workers else []
+            for _ in range(night_slots):
+                candidate = self._select_thursday_night_candidate(thursday, sat, sun)
+                if candidate:
+                    if not self._assign_shift(candidate, thursday, ShiftType.NIGHT):
+                        # Try next candidate if this fails
+                        continue
+                else:
+                    # No valid candidate - this is not a fatal error for Phase 2
+                    # The slot will be filled in Phase 3
+                    break
 
-        # Night: only compare among night-capable staff
-        night_shifts = [normalize(p, p.night_shifts) for p in night_capable] if night_capable else []
+        return True
 
-        # Day: only compare among night-capable staff (non-night workers naturally have more)
-        day_shifts = [normalize(p, p.day_shifts) for p in night_capable] if night_capable else []
+    def _select_thursday_night_candidate(
+        self, thursday: date, sat: date, sun: date
+    ) -> Optional[Person]:
+        """
+        Select the best candidate for Thursday night shift.
 
-        # Total: compare all staff (normalized for target ratio)
-        total_shifts = [normalize(p, p.total_shifts) for p in self.staff.values()]
+        Must NOT work upcoming weekend (compensation rule).
+        Prioritizes staff with more night shifts (gives them long weekend benefit).
+        """
+        candidates = []
 
-        def calc_range(lst):
-            return max(lst) - min(lst) if lst else 0
+        for person in self.staff.values():
+            # Skip if cannot do night shifts
+            if not person.can_do_night:
+                continue
 
-        def calc_variance(lst):
-            return statistics.variance(lst) if len(lst) > 1 else 0
+            # Skip if already assigned this day
+            if thursday in person.assigned_dates:
+                continue
 
-        # Score components (weighted)
-        # Weekend and Night fairness are most important
-        weekend_range = calc_range(weekend_shifts)
-        night_range = calc_range(night_shifts)
-        day_range = calc_range(day_shifts)
-        total_range = calc_range(total_shifts)
+            # CRITICAL: Skip if working upcoming weekend (compensation rule)
+            if sat in person.assigned_dates or sun in person.assigned_dates:
+                continue
 
-        # Heavy penalty if range > 1 (only for comparable groups)
-        score = 0
-        # Weekend balance is most critical - exponential penalty for imbalance
-        score += weekend_range * 200 + (weekend_range ** 2 * 100 if weekend_range > 1 else 0)
-        score += night_range * 80 + (40 if night_range > 1 else 0)
-        score += day_range * 60 + (30 if day_range > 1 else 0)
-        score += total_range * 40
+            # Check gap constraints
+            can_assign, _ = self._can_assign_shift(person, thursday, ShiftType.NIGHT)
+            if not can_assign:
+                if not self._emergency_can_assign(person, thursday, ShiftType.NIGHT):
+                    continue
 
-        # Add variance for tie-breaking
-        score += calc_variance(weekend_shifts) * 10 if weekend_shifts else 0
-        score += calc_variance(night_shifts) * 8 if night_shifts else 0
-        score += calc_variance(day_shifts) * 6 if day_shifts else 0
+            # Score: prioritize those with MORE night shifts (they need the weekend off)
+            # Also consider total shifts for balance
+            score = person.night_shifts * 10 - person.total_shifts
+            score += random.uniform(0, 5)
+            candidates.append((person, score))
 
-        # Heavy penalty if holiday workers have weekend shifts
-        for p in self.staff.values():
-            if (self.is_holiday_worker(p) or p.holiday_shifts > 0) and p.weekend_shifts > 0:
-                score += 10000  # Extremely strong penalty - this should never happen
+        if not candidates:
+            return None
 
-        # Penalty for multiple 24h shifts per person
-        for p in self.staff.values():
-            if p.shifts_24h > 1:
-                score += 100 * (p.shifts_24h - 1)
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[0][0]
 
-        return score
+    def _phase3_fill_weekdays(self) -> bool:
+        """
+        PHASE 3: Fill remaining weekday slots.
 
-    def _generate_single_schedule(self):
-        """Generate a single schedule attempt."""
-        # Process each day (skip holidays - they are handled via FixedOn lottery)
+        At this point:
+        - Weekend shifts are already assigned (Phase 1)
+        - Thursday nights are assigned (Phase 2)
+        - We just need to fill Mon, Tue, Wed, Fri and remaining slots
+
+        Uses standard greedy scoring with gap constraint enforcement.
+
+        Returns:
+            True if successful, False if coverage cannot be achieved
+        """
+        # Process each non-weekend, non-holiday date
         for d in self.dates:
-            # Skip holidays - holiday shifts are assigned via FixedOn (lottery)
+            # Skip holidays
             if self.is_holiday(d):
+                continue
+
+            # Skip weekends (already handled in Phase 1)
+            if self.is_weekend(d):
                 continue
 
             # Determine required shifts for this day
             day_slots_needed = self.day_shifts_per_day
             night_slots_needed = self.night_shifts_per_day
 
-            # Check how many are already filled by fixed assignments
+            # Check how many are already filled
             assigned_today = set()
             for (name, assigned_date), shift_type in self.schedule.items():
                 if assigned_date == d:
@@ -1431,62 +1130,111 @@ class Scheduler:
                         night_slots_needed -= 1
 
             # Fill Day shifts
+            day_filled = 0
             for _ in range(max(0, day_slots_needed)):
-                # Try multiple candidates in case some are blocked by hard constraints
                 tried = set()
-                while True:
+                assigned = False
+                while not assigned:
                     candidate = self._select_best_candidate(
                         d, ShiftType.DAY, exclude=assigned_today | tried
                     )
                     if not candidate:
                         break
 
-                    # Check if we should consider 24h shift
-                    # IMPORTANT: Do NOT assign 24h shifts on weekends (unfair double burden)
-                    consider_24h = (
-                        night_slots_needed > 0
-                        and not self.is_weekend(d)  # No 24h on weekends
-                        and random.random() < 0.15  # 15% chance to consider 24h
-                    )
-
-                    if consider_24h:
-                        # Find best candidate specifically for 24h (considers 24h fairness)
-                        best_24h = self._select_best_candidate(
-                            d, ShiftType.FULL_24H, exclude=assigned_today | tried
-                        )
-                        if best_24h and best_24h.shifts_24h == 0:
-                            # Only assign 24h if this person hasn't had one yet
-                            if self._assign_shift(best_24h, d, ShiftType.FULL_24H):
-                                assigned_today.add(best_24h.name)
-                                night_slots_needed -= 1
-                                break
-                            else:
-                                tried.add(best_24h.name)
-                                continue
-
                     if self._assign_shift(candidate, d, ShiftType.DAY):
                         assigned_today.add(candidate.name)
-                        break
+                        assigned = True
+                        day_filled += 1
                     else:
                         tried.add(candidate.name)
 
             # Fill Night shifts
+            night_filled = 0
             for _ in range(max(0, night_slots_needed)):
-                # Try multiple candidates in case some are blocked by hard constraints
                 tried = set()
-                while True:
+                assigned = False
+                while not assigned:
                     candidate = self._select_best_candidate(
                         d, ShiftType.NIGHT, exclude=assigned_today | tried
                     )
                     if not candidate:
                         break
+
                     if self._assign_shift(candidate, d, ShiftType.NIGHT):
                         assigned_today.add(candidate.name)
-                        break
+                        assigned = True
+                        night_filled += 1
                     else:
                         tried.add(candidate.name)
 
-        return self._validate_coverage()
+            # Check if this day has sufficient coverage
+            if day_filled < day_slots_needed or night_filled < night_slots_needed:
+                return False  # Coverage requirement not met
+
+        return True
+
+    def _calculate_fairness_score(self) -> float:
+        """
+        Calculate a fairness score for the current schedule.
+        Lower score = more fair.
+
+        Considers:
+        - Weekend shift variance (among non-holiday workers)
+        - Night shift variance (among night-capable staff)
+        - Total shift variance
+        - Hard constraint violations (heavy penalty)
+        """
+        import statistics
+
+        total_days = len(self.dates)
+
+        def normalize(p, value):
+            ratio = p.get_target_ratio(total_days)
+            return value * 2 if ratio == 0.5 else value
+
+        # Filter staff by capability
+        night_capable = [p for p in self.staff.values() if p.can_do_night]
+        non_holiday_workers = [
+            p for p in self.staff.values()
+            if not self.is_holiday_worker(p) and p.holiday_shifts == 0
+        ]
+
+        # Weekend: only compare among non-holiday workers
+        weekend_shifts = [p.weekend_shifts for p in non_holiday_workers] if non_holiday_workers else []
+
+        # Night: only compare among night-capable staff
+        night_shifts = [normalize(p, p.night_shifts) for p in night_capable] if night_capable else []
+
+        # Total: compare all staff
+        total_shifts = [normalize(p, p.total_shifts) for p in self.staff.values()]
+
+        def calc_range(lst):
+            return max(lst) - min(lst) if lst else 0
+
+        def calc_variance(lst):
+            return statistics.variance(lst) if len(lst) > 1 else 0
+
+        # Calculate score components
+        weekend_range = calc_range(weekend_shifts)
+        night_range = calc_range(night_shifts)
+        total_range = calc_range(total_shifts)
+
+        score = 0
+        # Weekend balance is most critical
+        score += weekend_range * 200 + (weekend_range ** 2 * 100 if weekend_range > 1 else 0)
+        score += night_range * 80 + (40 if night_range > 1 else 0)
+        score += total_range * 40
+
+        # Add variance for tie-breaking
+        score += calc_variance(weekend_shifts) * 10 if weekend_shifts else 0
+        score += calc_variance(night_shifts) * 8 if night_shifts else 0
+
+        # Heavy penalty if holiday workers have weekend shifts (should never happen)
+        for p in self.staff.values():
+            if (self.is_holiday_worker(p) or p.holiday_shifts > 0) and p.weekend_shifts > 0:
+                score += 10000
+
+        return score
 
     def _validate_coverage(self) -> bool:
         """Validate that all non-holiday days have required coverage."""
