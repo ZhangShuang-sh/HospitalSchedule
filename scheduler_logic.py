@@ -104,10 +104,10 @@ class Scheduler:
     """
 
     # Gap constraints
-    MIN_NIGHT_TO_NIGHT_GAP = 3
-    PREFERRED_NIGHT_TO_NIGHT_GAP = 5
-    MIN_DAY_TO_DAY_GAP = 3
-    MIN_NIGHT_TO_DAY_GAP = 3  # After night, must wait 3 days for day shift
+    MIN_NIGHT_TO_NIGHT_GAP = 5      # Normal: minimum 5 days between night shifts
+    EMERGENCY_NIGHT_TO_NIGHT_GAP = 3  # Fallback: minimum 3 days if not enough staff
+    MIN_DAY_TO_DAY_GAP = 3          # Minimum 3 days between day shifts
+    MIN_NIGHT_TO_DAY_GAP = 3        # After night, must wait 3 days for day shift
 
     def __init__(
         self,
@@ -232,22 +232,36 @@ class Scheduler:
         if shift_type == ShiftType.FULL_24H and not person.can_do_24h:
             return False
 
-        # Check gap rules
+        # Check gap rules - Night shifts (NIGHT or 24H)
+        # Check against ALL existing night shifts to handle non-chronological assignment
         if shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H):
-            if person.last_night_shift:
-                gap = (d - person.last_night_shift).days
-                if gap < self.MIN_NIGHT_TO_NIGHT_GAP:
-                    return False
+            for (name, assigned_date), stype in self.schedule.items():
+                if name == person.name and stype in (ShiftType.NIGHT, ShiftType.FULL_24H):
+                    gap = abs((d - assigned_date).days)
+                    if gap > 0 and gap < self.MIN_NIGHT_TO_NIGHT_GAP:
+                        return False
+            # Also check: if assigning a night shift, are there day shifts within
+            # the next MIN_NIGHT_TO_DAY_GAP days that would be violated?
+            for (name, assigned_date), stype in self.schedule.items():
+                if name == person.name and stype in (ShiftType.DAY, ShiftType.FULL_24H):
+                    gap = (assigned_date - d).days  # day_date - night_date
+                    if gap > 0 and gap < self.MIN_NIGHT_TO_DAY_GAP:
+                        return False  # Day shift too soon after this night shift
 
-        if shift_type == ShiftType.DAY:
-            if person.last_night_shift:
-                gap = (d - person.last_night_shift).days
-                if gap < self.MIN_NIGHT_TO_DAY_GAP:
-                    return False
-            if person.last_day_shift:
-                gap = (d - person.last_day_shift).days
-                if gap < self.MIN_DAY_TO_DAY_GAP:
-                    return False
+        # Check gap rules - Day shifts (DAY or 24H)
+        if shift_type in (ShiftType.DAY, ShiftType.FULL_24H):
+            # Night-to-Day gap: no day shift within MIN_NIGHT_TO_DAY_GAP days after night
+            for (name, assigned_date), stype in self.schedule.items():
+                if name == person.name and stype in (ShiftType.NIGHT, ShiftType.FULL_24H):
+                    gap = (d - assigned_date).days
+                    if gap > 0 and gap < self.MIN_NIGHT_TO_DAY_GAP:
+                        return False
+            # Day-to-Day gap: check against ALL existing day shifts
+            for (name, assigned_date), stype in self.schedule.items():
+                if name == person.name and stype in (ShiftType.DAY, ShiftType.FULL_24H):
+                    gap = abs((d - assigned_date).days)
+                    if gap > 0 and gap < self.MIN_DAY_TO_DAY_GAP:
+                        return False
 
         # Weekend constraint: max 1 shift per weekend per person
         if self.is_weekend(d):
@@ -286,24 +300,36 @@ class Scheduler:
         if shift_type == ShiftType.FULL_24H and not person.can_do_24h:
             return False, "Cannot do 24h shifts"
 
-        # Check gap rules
+        # Check gap rules - Night shifts (NIGHT or 24H)
+        # Check against ALL existing night shifts to handle non-chronological assignment
         if shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H):
-            if person.last_night_shift:
-                gap = (d - person.last_night_shift).days
-                if gap < self.MIN_NIGHT_TO_NIGHT_GAP:
-                    return False, f"Night gap too short ({gap} days)"
+            for (name, assigned_date), stype in self.schedule.items():
+                if name == person.name and stype in (ShiftType.NIGHT, ShiftType.FULL_24H):
+                    gap = abs((d - assigned_date).days)
+                    if gap > 0 and gap < self.MIN_NIGHT_TO_NIGHT_GAP:
+                        return False, f"Night gap too short ({gap} days)"
+            # Also check: if assigning a night shift, are there day shifts within
+            # the next MIN_NIGHT_TO_DAY_GAP days that would be violated?
+            for (name, assigned_date), stype in self.schedule.items():
+                if name == person.name and stype in (ShiftType.DAY, ShiftType.FULL_24H):
+                    gap = (assigned_date - d).days  # day_date - night_date
+                    if gap > 0 and gap < self.MIN_NIGHT_TO_DAY_GAP:
+                        return False, f"Existing day shift too close ({gap} days after)"
 
-        if shift_type == ShiftType.DAY:
-            # Cannot do Day immediately after Night
-            if person.last_night_shift:
-                gap = (d - person.last_night_shift).days
-                if gap < self.MIN_NIGHT_TO_DAY_GAP:
-                    return False, f"Night-to-Day gap too short ({gap} days)"
-
-            if person.last_day_shift:
-                gap = (d - person.last_day_shift).days
-                if gap < self.MIN_DAY_TO_DAY_GAP:
-                    return False, f"Day gap too short ({gap} days)"
+        # Check gap rules - Day shifts (DAY or 24H)
+        if shift_type in (ShiftType.DAY, ShiftType.FULL_24H):
+            # Night-to-Day gap: no day shift within MIN_NIGHT_TO_DAY_GAP days after night
+            for (name, assigned_date), stype in self.schedule.items():
+                if name == person.name and stype in (ShiftType.NIGHT, ShiftType.FULL_24H):
+                    gap = (d - assigned_date).days
+                    if gap > 0 and gap < self.MIN_NIGHT_TO_DAY_GAP:
+                        return False, f"Night-to-Day gap too short ({gap} days)"
+            # Day-to-Day gap: check against ALL existing day shifts
+            for (name, assigned_date), stype in self.schedule.items():
+                if name == person.name and stype in (ShiftType.DAY, ShiftType.FULL_24H):
+                    gap = abs((d - assigned_date).days)
+                    if gap > 0 and gap < self.MIN_DAY_TO_DAY_GAP:
+                        return False, f"Day gap too short ({gap} days)"
 
         # Weekend constraint: max 1 shift per weekend per person
         if self.is_weekend(d):
@@ -484,12 +510,12 @@ class Scheduler:
             elif person_night_norm >= max_night_norm and max_night_norm - min_night_norm >= 1:
                 score -= 30
 
-            # Gap bonus
+            # Gap bonus - prefer larger gaps
             if person.last_night_shift:
                 gap = (d - person.last_night_shift).days
-                if gap >= self.PREFERRED_NIGHT_TO_NIGHT_GAP:
+                if gap >= self.MIN_NIGHT_TO_NIGHT_GAP:  # >= 5 days
                     score += 5
-                elif gap >= self.MIN_NIGHT_TO_NIGHT_GAP:
+                elif gap >= self.EMERGENCY_NIGHT_TO_NIGHT_GAP:  # >= 3 days (emergency)
                     score += 2
 
         # Weekend fairness - strict control to keep difference <= 1
@@ -594,8 +620,9 @@ class Scheduler:
 
     def _emergency_can_assign(self, person: Person, d: date, shift_type: ShiftType) -> bool:
         """
-        Emergency assignment check - only checks absolute constraints, ignores gap rules.
-        Used as last resort to ensure coverage.
+        Emergency assignment check - uses relaxed gap rules (3 days for night-to-night).
+        Used as fallback when normal 5-day gap cannot be satisfied.
+        Checks ALL assigned shifts, not just last_night_shift, for robustness.
         """
         # Check availability period
         if not person.is_available_on(d):
@@ -614,6 +641,38 @@ class Scheduler:
             return False
         if shift_type == ShiftType.FULL_24H and not person.can_do_24h:
             return False
+
+        # Emergency gap rules - check against ALL assigned shifts, not just last
+        # Use emergency gap (3 days) for night-to-night instead of normal (5 days)
+        if shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H):
+            # Check gap with ALL night shifts
+            for (name, assigned_date), stype in self.schedule.items():
+                if name == person.name and stype in (ShiftType.NIGHT, ShiftType.FULL_24H):
+                    gap = abs((d - assigned_date).days)
+                    if gap > 0 and gap < self.EMERGENCY_NIGHT_TO_NIGHT_GAP:
+                        return False
+            # Also check: if assigning a night shift, are there day shifts within
+            # the next MIN_NIGHT_TO_DAY_GAP days that would be violated?
+            for (name, assigned_date), stype in self.schedule.items():
+                if name == person.name and stype in (ShiftType.DAY, ShiftType.FULL_24H):
+                    gap = (assigned_date - d).days  # day_date - night_date
+                    if gap > 0 and gap < self.MIN_NIGHT_TO_DAY_GAP:
+                        return False  # Day shift too soon after this night shift
+
+        # Day shifts (DAY or 24H) also need gap checks
+        if shift_type in (ShiftType.DAY, ShiftType.FULL_24H):
+            # Night-to-Day gap is a hard constraint (no day shift within 3 days after night)
+            for (name, assigned_date), stype in self.schedule.items():
+                if name == person.name and stype in (ShiftType.NIGHT, ShiftType.FULL_24H):
+                    gap = (d - assigned_date).days
+                    if gap > 0 and gap < self.MIN_NIGHT_TO_DAY_GAP:
+                        return False
+            # Day-to-Day gap is also enforced
+            for (name, assigned_date), stype in self.schedule.items():
+                if name == person.name and stype in (ShiftType.DAY, ShiftType.FULL_24H):
+                    gap = abs((d - assigned_date).days)
+                    if gap > 0 and gap < self.MIN_DAY_TO_DAY_GAP:
+                        return False
 
         # Weekend constraints (these are hard constraints, not relaxable)
         if self.is_weekend(d):
@@ -922,6 +981,64 @@ class Scheduler:
 
         return False
 
+    def _get_all_night_shifts(self, person: Person) -> List[date]:
+        """Get all night shift dates for a person from the schedule."""
+        night_dates = []
+        for (name, assigned_date), shift_type in self.schedule.items():
+            if name == person.name and shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H):
+                night_dates.append(assigned_date)
+        return sorted(night_dates)
+
+    def _get_all_day_shifts(self, person: Person) -> List[date]:
+        """Get all day shift dates for a person from the schedule."""
+        day_dates = []
+        for (name, assigned_date), shift_type in self.schedule.items():
+            if name == person.name and shift_type in (ShiftType.DAY, ShiftType.FULL_24H):
+                day_dates.append(assigned_date)
+        return sorted(day_dates)
+
+    def _check_night_gap_with_all_shifts(self, person: Person, d: date, min_gap: int) -> bool:
+        """Check if assigning a night shift on date d violates gap constraints with ALL existing night shifts."""
+        night_shifts = self._get_all_night_shifts(person)
+        for existing_date in night_shifts:
+            gap = abs((d - existing_date).days)
+            if gap > 0 and gap < min_gap:
+                return False  # Violation
+        return True  # No violation
+
+    def _check_day_gap_with_all_shifts(self, person: Person, d: date, min_gap: int) -> bool:
+        """Check if assigning a day shift on date d violates gap constraints with ALL existing day shifts."""
+        day_shifts = self._get_all_day_shifts(person)
+        for existing_date in day_shifts:
+            gap = abs((d - existing_date).days)
+            if gap > 0 and gap < min_gap:
+                return False  # Violation
+        return True  # No violation
+
+    def _check_night_to_day_gap(self, person: Person, d: date, min_gap: int) -> bool:
+        """Check if assigning a day shift on date d violates night-to-day gap constraints."""
+        night_shifts = self._get_all_night_shifts(person)
+        for night_date in night_shifts:
+            gap = (d - night_date).days
+            # Only check forward: day shift should not be within min_gap days AFTER a night shift
+            if gap > 0 and gap < min_gap:
+                return False  # Violation
+        return True  # No violation
+
+    def _check_reverse_night_to_day_gap(self, person: Person, night_date: date, min_gap: int) -> bool:
+        """Check if assigning a night shift would violate gaps with EXISTING day shifts.
+
+        When assigning a night shift, we need to ensure there are no day shifts
+        within the next min_gap days (since day shifts should not come too soon
+        after a night shift).
+        """
+        day_shifts = self._get_all_day_shifts(person)
+        for day_date in day_shifts:
+            gap = (day_date - night_date).days  # positive if day is after night
+            if gap > 0 and gap < min_gap:
+                return False  # Existing day shift is too soon after this night shift
+        return True  # No violation
+
     def _can_swap_shift(self, from_person: Person, to_person: Person, d: date, shift_type: ShiftType) -> bool:
         """Check if a shift can be swapped from one person to another."""
         # Check basic capability
@@ -938,22 +1055,21 @@ class Scheduler:
         if d in to_person.assigned_dates:
             return False
 
-        # Check gap constraints for to_person
+        # Check gap constraints for to_person - check against ALL shifts, not just last
         if shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H):
-            if to_person.last_night_shift:
-                gap = abs((d - to_person.last_night_shift).days)
-                if gap < self.MIN_NIGHT_TO_NIGHT_GAP and gap > 0:
-                    return False
+            if not self._check_night_gap_with_all_shifts(to_person, d, self.MIN_NIGHT_TO_NIGHT_GAP):
+                return False
+            # Also check reverse: existing day shifts that would be too close after this night
+            if not self._check_reverse_night_to_day_gap(to_person, d, self.MIN_NIGHT_TO_DAY_GAP):
+                return False
 
-        if shift_type == ShiftType.DAY:
-            if to_person.last_night_shift:
-                gap = (d - to_person.last_night_shift).days
-                if 0 < gap < self.MIN_NIGHT_TO_DAY_GAP:
-                    return False
-            if to_person.last_day_shift:
-                gap = abs((d - to_person.last_day_shift).days)
-                if gap < self.MIN_DAY_TO_DAY_GAP and gap > 0:
-                    return False
+        if shift_type in (ShiftType.DAY, ShiftType.FULL_24H):
+            # Night-to-Day gap check
+            if not self._check_night_to_day_gap(to_person, d, self.MIN_NIGHT_TO_DAY_GAP):
+                return False
+            # Day-to-Day gap check
+            if not self._check_day_gap_with_all_shifts(to_person, d, self.MIN_DAY_TO_DAY_GAP):
+                return False
 
         # Don't swap to holiday workers for weekend shifts
         if self.is_weekend(d) and to_person.holiday_shifts > 0:
@@ -1327,8 +1443,9 @@ class Scheduler:
             candidates.sort(key=lambda x: x[1], reverse=True)
             return candidates[0][0]
 
-        # Third try: FORCE find someone - ignore all constraints except capability
-        # This ensures we NEVER have an uncovered shift
+        # Third try: FORCE find someone - but still respect MINIMUM gap constraints
+        # Night-to-night must be at least EMERGENCY gap (3 days) - this is an absolute minimum
+        # This ensures we maintain safety constraints while still finding coverage
         for name, person in self.staff.items():
             if name == exclude_name:
                 continue
@@ -1343,12 +1460,73 @@ class Scheduler:
             if d in person.assigned_dates:
                 continue
 
+            # STILL enforce minimum gap constraints even in FORCE mode
+            # These are absolute safety constraints that cannot be violated
+            if shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H):
+                if not self._check_night_gap_with_all_shifts(person, d, self.EMERGENCY_NIGHT_TO_NIGHT_GAP):
+                    continue  # Must have at least 3 days between night shifts
+                # Also check: existing day shifts that would be too close after this night
+                if not self._check_reverse_night_to_day_gap(person, d, self.MIN_NIGHT_TO_DAY_GAP):
+                    continue  # No day shift within 3 days after this night shift
+
+            if shift_type in (ShiftType.DAY, ShiftType.FULL_24H):
+                if not self._check_night_to_day_gap(person, d, self.MIN_NIGHT_TO_DAY_GAP):
+                    continue  # No day shift within 3 days after night
+                if not self._check_day_gap_with_all_shifts(person, d, self.MIN_DAY_TO_DAY_GAP):
+                    continue  # Must have at least 3 days between day shifts
+
             candidates.append((person, calculate_priority(person) - 1000))
 
         if candidates:
             candidates.sort(key=lambda x: x[1], reverse=True)
             return candidates[0][0]
 
+        # Fourth try: ABSOLUTE FORCE with minimal constraints
+        # Still enforce CRITICAL gap constraints to prevent unsafe scheduling:
+        # - Night-to-Night: minimum 3 days (emergency gap)
+        # - Night-to-Day: minimum 3 days (no day shift within 3 days after night)
+        # - Day-to-Day: minimum 3 days
+        # These are non-negotiable safety constraints.
+        for name, person in self.staff.items():
+            if name == exclude_name:
+                continue
+
+            if shift_type == ShiftType.NIGHT and not person.can_do_night:
+                continue
+            if shift_type == ShiftType.FULL_24H and not person.can_do_24h:
+                continue
+
+            if d in person.assigned_dates:
+                continue
+
+            # CRITICAL: Always enforce minimum gap constraints
+            # Night shifts
+            if shift_type in (ShiftType.NIGHT, ShiftType.FULL_24H):
+                # Check night-to-night gap (emergency minimum: 3 days)
+                if not self._check_night_gap_with_all_shifts(person, d, self.EMERGENCY_NIGHT_TO_NIGHT_GAP):
+                    continue
+                # Check reverse night-to-day: no day shift within 3 days after this night
+                if not self._check_reverse_night_to_day_gap(person, d, self.MIN_NIGHT_TO_DAY_GAP):
+                    continue
+
+            # Day shifts
+            if shift_type in (ShiftType.DAY, ShiftType.FULL_24H):
+                # Check day-to-day gap (minimum: 3 days)
+                if not self._check_day_gap_with_all_shifts(person, d, self.MIN_DAY_TO_DAY_GAP):
+                    continue
+                # Check night-to-day: no day shift within 3 days after night
+                if not self._check_night_to_day_gap(person, d, self.MIN_NIGHT_TO_DAY_GAP):
+                    continue
+
+            candidates.append((person, calculate_priority(person) - 2000))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            return candidates[0][0]
+
+        # If truly no one can take the shift without violating critical gaps,
+        # return None. The caller will handle this (either by alerting user
+        # or keeping the original assignment).
         return None
 
     def get_coverage_summary(self) -> List[dict]:
