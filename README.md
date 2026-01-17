@@ -1,107 +1,516 @@
-# Hospital Shift Scheduling System
+# 医院排班系统
 
-A Streamlit-based web application for generating fair and balanced monthly shift schedules for hospital departments.
+一个基于 Streamlit 的智能排班系统，专为医院科室（如风湿免疫科）设计，能够自动生成公平、合理的月度值班表。
 
-## Features
+## 目录
 
-- **Automatic Schedule Generation**: Creates monthly schedules with Day, Night, and 24-hour shifts
-- **Fairness Optimization**: Balances weekend, night, and total shifts across staff (max difference of 1)
-- **Flexible Staff Configuration**:
-  - Set which staff can do night/24h shifts
-  - Define fixed days off (supports ranges like `17-20`)
-  - Pre-assign specific shifts (e.g., `1:Day,25:Night`)
-- **Smart Constraints**:
-  - Minimum 3-day gap between night shifts
-  - Thursday night workers get weekend off
-  - Max 1 shift per weekend per person
-  - Holiday workers don't work weekends
-- **Temporary Leave Handling**: Reschedule shifts when someone takes leave
-- **Export**: Download schedules and statistics as CSV
+- [功能概述](#功能概述)
+- [快速开始](#快速开始)
+- [使用指南](#使用指南)
+  - [基本设置](#基本设置)
+  - [人员配置](#人员配置)
+  - [生成排班](#生成排班)
+  - [查看结果](#查看结果)
+  - [临时请假](#临时请假)
+- [排班规则详解](#排班规则详解)
+  - [间隔规则](#间隔规则)
+  - [周末规则](#周末规则)
+  - [节假日规则](#节假日规则)
+  - [公平性规则](#公平性规则)
+  - [50%工作量规则](#50工作量规则)
+- [数据格式说明](#数据格式说明)
+- [常见问题](#常见问题)
 
-## How to Use
+---
 
-### 1. Configure Staff
+## 功能概述
 
-In the **Staff Setup** tab:
-- Add staff members with their names and roles
-- Check/uncheck **Night OK** and **24h OK** based on capabilities
-- Enter **Fixed Off** dates (e.g., `5,10,15` or `17-20` for a range)
-- Enter **Fixed On** for pre-assigned shifts (e.g., `1:Day` for Day shift on the 1st)
+### 核心功能
 
-### 2. Set Schedule Parameters
+| 功能 | 说明 |
+|------|------|
+| **智能排班** | 自动生成月度值班表，考虑所有约束条件 |
+| **公平分配** | 确保周末、夜班、总班次在员工间公平分配 |
+| **约束满足** | 严格遵守间隔规则、能力限制、固定休息日等 |
+| **临时调班** | 支持员工临时请假并自动重新分配班次 |
+| **数据导出** | 可导出排班表和统计数据为 CSV 文件 |
 
-In the sidebar:
-- Select **Year** and **Month**
-- Enter **Holiday dates** (comma-separated)
-- Adjust shifts per day if needed
+### 班次类型
 
-### 3. Generate Schedule
+| 类型 | 标识 | 权重 | 说明 |
+|------|------|------|------|
+| 白班 | D (Day) | 1 | 白天值班 |
+| 夜班 | N (Night) | 1 | 夜间值班 |
+| 24小时班 | 24 | 2 | 全天值班（计为1白班+1夜班） |
 
-Click **Generate Schedule** to create the monthly schedule. The system will:
-- Try 20 different combinations to find the fairest distribution
-- Optimize shift balance through post-generation swaps
-- Display the result with color-coded shifts
+---
 
-### 4. View Results
+## 快速开始
 
-- **Schedule Tab**: View the monthly calendar with shifts highlighted
-- **Statistics Tab**: See fairness metrics and individual shift counts
-- **Export**: Download CSV files for further use
+### 环境要求
 
-### 5. Handle Temporary Leave
+- Python 3.8+
+- Streamlit
+- Pandas
 
-If someone needs to take unexpected leave:
-1. Go to the Schedule tab
-2. Use the **Temporary Leave & Rescheduling** section
-3. Select the person and enter leave dates
-4. Click **Reschedule** to automatically reassign their shifts
-
-## Shift Types
-
-| Type | Symbol | Weight | Color |
-|------|--------|--------|-------|
-| Day | D | 1 | Green |
-| Night | N | 1 | Blue |
-| 24-Hour | 24 | 2 | Pink |
-
-## Scheduling Rules
-
-1. **Coverage**: Every day must have at least 1 Day shift and 1 Night shift
-2. **Gap Rules**:
-   - Night-to-Night: minimum 3 days (prefer 5)
-   - Night-to-Day: minimum 3 days
-   - Day-to-Day: minimum 3 days
-3. **Weekend Rules**:
-   - Max 1 shift per weekend per person
-   - Thursday night = weekend off
-   - Holiday workers don't work weekends
-4. **Fairness**: Weekend and Night shifts balanced (max diff = 1)
-5. **50% Target**: Staff with 14+ days off get 50% of normal shifts
-
-## Local Development
+### 安装运行
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# 安装依赖
+pip install streamlit pandas
 
-# Run the app
+# 启动应用
 streamlit run app.py
 ```
 
-## Deployment
+应用将在浏览器中打开，默认地址：http://localhost:8501
 
-This app is designed for deployment on [Streamlit Community Cloud](https://streamlit.io/cloud).
+---
 
-1. Push the code to a GitHub repository
-2. Connect your repository to Streamlit Community Cloud
-3. Deploy with `app.py` as the main file
+## 使用指南
 
-## Files
+### 基本设置
 
-- `app.py` - Streamlit UI and main application
-- `scheduler_logic.py` - Core scheduling algorithm
-- `utils.py` - Helper functions and utilities
-- `requirements.txt` - Python dependencies
+在左侧边栏进行基本配置：
+
+1. **选择年份和月份**
+   - 年份范围：2024-2030
+   - 月份：1-12月
+
+2. **设置节假日**
+   - 输入格式支持多种：
+     - 单个日期：`1` 或 `2026-01-01`
+     - 多个日期：`1,2,3` 或 `1;2;3`
+     - 日期范围：`1-7`（表示1日到7日）
+     - 混合格式：`1-3,15,25-31`
+
+3. **配置每日班次数**
+   - 白班人数：1-5人（默认1人）
+   - 夜班人数：1-3人（默认1人）
+   - 系统会根据人员数量自动调整
+
+### 人员配置
+
+在「人员设置」标签页配置值班人员：
+
+#### 方式一：手动编辑
+
+直接在表格中编辑人员信息：
+
+| 字段 | 说明 | 示例 |
+|------|------|------|
+| **姓名** | 必填，人员姓名 | 张三 |
+| **职称** | 下拉选择 | 主治医师/住院医师/规培生/实习生/其他 |
+| **可夜班** | 是否能值夜班 | ✓ 或 ✗ |
+| **可24h** | 是否能值24小时班 | ✓ 或 ✗ |
+| **固定休息** | 不能值班的日期 | `5,10,15` 或 `17-20` |
+| **固定值班** | 预先指定的班次 | `1:Day,25:Night` |
+
+#### 方式二：CSV导入
+
+上传 CSV 文件批量导入人员数据。CSV 格式：
+
+```csv
+Name,Role,CanDoNight,CanDo24h,FixedOff,FixedOn
+张三,Attending,True,True,,1:Day
+李四,Fellow,True,True,16-31,
+王五,Student,False,False,5;10;15,
+```
+
+#### 固定休息日格式
+
+- 单个日期：`5`
+- 多个日期：`5,10,15` 或 `5;10;15`
+- 日期范围：`17-20`（17日到20日）
+- 混合格式：`5,10-15,25`
+
+#### 固定值班格式
+
+格式为 `日期:班次类型`，多个用逗号分隔：
+
+- 单个：`1:Day`（1日白班）
+- 多个：`1:Day,25:Night`（1日白班，25日夜班）
+- 班次类型：`Day`（白班）、`Night`（夜班）、`24h`（24小时班）
+
+### 生成排班
+
+1. 配置完成后，点击「生成排班表」按钮
+2. 系统会尝试20次不同的排班组合，选择最公平的方案
+3. 生成成功后会显示彩色气球动画
+
+### 查看结果
+
+#### 排班表标签页
+
+- **颜色说明**：
+  - 浅绿色 = 白班
+  - 浅蓝色 = 夜班
+  - 浅粉色 = 24小时班
+  - 黄色背景 = 周末
+  - 红色背景 = 节假日
+
+- **表头信息**：显示日期和星期
+
+#### 统计标签页
+
+显示详细的统计数据：
+
+1. **公平性指标**
+   - 周末班次差异（最大-最小）
+   - 夜班班次差异
+   - 白班班次差异
+   - 差异≤1显示绿色，>1显示红色
+
+2. **汇总统计**
+   - 平均总班次 ± 标准差
+   - 平均夜班数 ± 标准差
+   - 平均周末班次 ± 标准差
+   - 平均加权班次 ± 标准差
+
+3. **个人详情表**
+   - 每人的目标班次、实际班次、各类型班次数
+
+#### 覆盖率汇总
+
+展开可查看每日的具体排班情况：
+- 日期、星期
+- 是否周末/节假日
+- 白班人数和人员名单
+- 夜班人数和人员名单
+
+### 临时请假
+
+当员工需要临时请假时：
+
+1. 在「临时请假与调班」区域选择请假人员
+2. 输入请假日期（格式同固定休息日）
+3. 点击「重新安排」
+4. 系统会自动寻找替班人员
+
+调班结果说明：
+- 绿色：成功找到替班人员
+- 黄色：无法找到替班，保持原安排
+- 红色：替班被约束条件阻止
+
+### 导出数据
+
+- **排班表 CSV**：完整的月度排班表
+- **统计 CSV**：所有人员的统计数据
+
+文件自动命名为：`schedule_年份_月份.csv`
+
+---
+
+## 排班规则详解
+
+### 间隔规则
+
+系统严格遵守班次间隔要求，保障医护人员休息：
+
+| 规则 | 正常间隔 | 紧急间隔 | 说明 |
+|------|----------|----------|------|
+| 夜班→夜班 | 6天 | 4天 | 两次夜班之间需间隔5个完整天 |
+| 白班→白班 | 4天 | 4天 | 两次白班之间需间隔3个完整天 |
+| 夜班→白班 | 4天 | 4天 | 夜班后需休息3天才能白班 |
+
+**注意**："间隔N天"指的是两次班次之间有N个完整的休息日。
+
+例如：1月27日夜班 → 下一次夜班最早2月1日（中间28、29、30、31日休息，共4天）
+
+### 周末规则
+
+1. **每周末最多1班**
+   - 同一周末（周六+周日）每人最多值1次班
+   - 周六值班则周日不排班，反之亦然
+
+2. **周四夜班补偿规则**
+   - 周四夜班人员自动获得周五、周六、周日休息
+   - 相当于获得一个长周末作为补偿
+
+3. **周末公平分配**
+   - 非节假日值班人员的周末班次差异不超过1次
+   - 系统自动平衡周末班次分配
+
+### 节假日规则
+
+**核心规则：节假日值班人员不再安排周末班**
+
+这是一个硬约束，不可违反：
+- 如果某人在固定值班（FixedOn）中有节假日班次
+- 该人员将被标记为「节假日值班人员」
+- 整个月份内不会再被安排任何周末班次
+- 这是对节假日值班的补偿
+
+**示例**：
+- 张三固定值班设为 `1:Night`（1月1日元旦夜班）
+- 张三成为节假日值班人员
+- 张三整个1月都不会被安排周末班
+
+### 公平性规则
+
+系统追求多维度的公平分配：
+
+| 维度 | 目标 | 比较范围 |
+|------|------|----------|
+| 周末班次 | 差异≤1 | 非节假日值班人员 |
+| 夜班班次 | 差异≤1 | 可夜班人员（标准化后） |
+| 白班班次 | 差异≤1 | 可夜班人员 |
+| 总班次 | 尽量均衡 | 所有人员（标准化后） |
+
+**优先级排序**：
+1. 周末公平（最重要）
+2. 夜班公平
+3. 白班公平
+4. 总班次均衡
+
+### 50%工作量规则
+
+针对半月工作的人员：
+
+- **触发条件**：固定休息日 ≥ 14天
+- **效果**：目标班次减半
+- **公平性**：比较时班次数×2进行标准化
+
+**示例**：
+- 李四固定休息：`16-31`（16天休息）
+- 李四的目标班次为正常人员的50%
+- 统计比较时，李四的4次夜班等效于8次（乘以2）
+
+### 24小时班规则
+
+1. **权重计算**：1次24h班 = 1次白班 + 1次夜班（权重为2）
+2. **分散原则**：优先每人最多1次24h班
+3. **周末限制**：周末不安排24h班（避免双倍负担）
+4. **能力要求**：只有标记「可24h」的人员才会被分配
+
+---
+
+## 数据格式说明
+
+### 输入格式
+
+#### 人员数据 DataFrame
+
+| 列名 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| Name | 字符串 | 是 | 人员姓名 |
+| Role | 字符串 | 否 | 职称（Attending/Fellow/Resident/Student/Other） |
+| CanDoNight | 布尔值 | 否 | 是否可夜班，默认True |
+| CanDo24h | 布尔值 | 否 | 是否可24h班，默认True |
+| FixedOff | 字符串 | 否 | 固定休息日 |
+| FixedOn | 字符串 | 否 | 固定值班 |
+
+#### 节假日格式
+
+```
+1,2,3          # 1日、2日、3日
+1-7            # 1日到7日（春节假期）
+1-3,15,25-31   # 混合格式
+```
+
+### 输出格式
+
+#### 排班表 CSV
+
+```csv
+日期,星期,张三,李四,王五,...
+1,三,D,N,,
+2,四,,D,N,
+...
+```
+
+#### 统计表 CSV
+
+```csv
+姓名,目标班次,总班次,白班,夜班,24h班,周末班,节假日班,加权总计
+张三,8.5,9,4,4,1,2,1,10
+李四,4.25,4,2,2,0,1,0,4
+...
+```
+
+---
+
+## 常见问题
+
+### Q: 为什么生成排班失败？
+
+**可能原因**：
+1. 人员数量不足以满足班次需求和间隔约束
+2. 固定休息日设置过多，导致可用人员不足
+3. 过多人员被标记为节假日值班人员，周末无人可排
+
+**解决方案**：
+- 增加值班人员
+- 减少固定休息日
+- 确保足够的周末可用人员（非节假日值班人员）
+
+### Q: 为什么某人周末班次比别人多？
+
+**可能原因**：
+1. 其他人是节假日值班人员（不排周末）
+2. 其他人有周末的固定休息日
+3. 间隔规则限制了其他人员的周末可用性
+
+**查看方法**：
+- 检查统计表中的「节假日班」列
+- 有节假日班的人员不会被安排周末班
+
+### Q: 如何确保某人不值周末班？
+
+**方法一**：设置固定休息日
+```
+FixedOff: 4,5,11,12,18,19,25,26  # 所有周末
+```
+
+**方法二**：让其值节假日班
+```
+FixedOn: 1:Night  # 假设1日是节假日
+```
+这样该人员会自动被排除在周末班之外。
+
+### Q: 夜班间隔不够怎么办？
+
+当人员不足时，系统会启用「紧急模式」：
+- 夜班间隔从5天降至3天
+- 但会在评分中扣分，优先选择正常间隔的方案
+
+### Q: 如何理解「加权总计」？
+
+加权总计 = 白班数 × 1 + 夜班数 × 1 + 24h班数 × 2
+
+24h班权重为2是因为它实际包含了白班和夜班两部分工作。
+
+### Q: 系统如何选择最优排班？
+
+系统使用多阶段算法：
+
+1. **第一阶段**：先排周末班（确保节假日人员被排除）
+2. **第二阶段**：排周四夜班（触发长周末补偿）
+3. **第三阶段**：填充工作日班次
+4. **第四阶段**：验证所有约束并计算公平性得分
+
+系统会尝试20次不同的随机种子，选择公平性得分最低（最公平）的方案。
+
+### Q: 临时调班有什么限制？
+
+调班时会检查所有约束：
+- 间隔规则
+- 周末规则
+- 能力限制（夜班能力、24h能力）
+- 节假日人员限制
+
+如果找不到满足所有约束的替班人员，会显示黄色警告。
+
+---
+
+## 算法原理
+
+### 多阶段排班算法
+
+本系统采用「多阶段分配」算法，按优先级顺序处理不同类型的班次：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    第0阶段：初始化                        │
+│  • 处理固定值班（FixedOn）                                │
+│  • 识别节假日值班人员                                     │
+│  • 确定周末可用人员名单                                   │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│                  第1阶段：周末班分配                      │
+│  • 优先分配所有周末班次                                   │
+│  • 节假日人员自动排除                                     │
+│  • 确保周末班公平分配（差异≤1）                           │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│                 第2阶段：周四夜班分配                     │
+│  • 分配周四夜班                                          │
+│  • 触发周五/六/日休息补偿                                 │
+│  • 优先分配给夜班较多的人员                               │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│                  第3阶段：工作日填充                      │
+│  • 填充周一至周五剩余班次                                 │
+│  • 遵守所有间隔约束                                       │
+│  • 优化公平性评分                                         │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│                   第4阶段：验证优化                       │
+│  • 验证每日覆盖率                                         │
+│  • 检查所有硬约束                                         │
+│  • 计算公平性得分，保留最优方案                           │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 评分系统
+
+系统使用评分机制选择最佳候选人：
+
+**加分项**（优先选择）：
+- 总班次较少的人员：+50分
+- 不能值夜班的人员值白班：+80分
+- 夜班较少的人员值夜班：+30分
+- 周末班较少的人员值周末：+100分
+
+**扣分项**（避免选择）：
+- 已超过目标班次：-50至-500分
+- 节假日人员值周末：-1000分
+- 多次24小时班：-200至-300分
+- 会导致周末不公平：-200分
+
+---
+
+## 本地开发
+
+```bash
+# 安装依赖
+pip install -r requirements.txt
+
+# 运行应用
+streamlit run app.py
+```
+
+## 部署
+
+本应用支持部署到 [Streamlit Community Cloud](https://streamlit.io/cloud)：
+
+1. 将代码推送到 GitHub 仓库
+2. 在 Streamlit Cloud 连接仓库
+3. 选择 `app.py` 作为主文件进行部署
+
+## 文件结构
+
+```
+HospitalSchedule/
+├── app.py              # Streamlit 界面和主应用
+├── scheduler_logic.py  # 核心排班算法
+├── utils.py            # 辅助函数
+├── requirements.txt    # Python 依赖
+└── README.md           # 本文档
+```
+
+---
+
+## 技术支持
+
+如有问题或建议，请提交 Issue：
+https://github.com/ZhangShuang-sh/HospitalSchedule/issues
+
+---
+
+## 版本信息
+
+- **当前版本**：2.0
+- **更新日期**：2026年1月
+- **主要更新**：
+  - 重构为多阶段排班算法
+  - 强化节假日人员周末约束
+  - 优化公平性计算
+  - 改进错误处理和用户提示
 
 ## License
 
